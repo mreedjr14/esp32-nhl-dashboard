@@ -110,29 +110,66 @@
 // client-side (wins+losses+ot_losses) since the payload never carried
 // it as its own field.
 //
+// Iteration 8 (self-serve WiFi + team setup, moved to its own public repo):
+// this sketch used to hardcode both the WiFi credentials and the team
+// (Flyers-only, via dashboard_publish.py's TEAM constant) - fine for one
+// device on one home network, not fine for handing boards to friends on
+// their own networks who want their own team. WiFi.begin() with a
+// hardcoded ssid/password is gone in favor of WiFiManager: on first boot
+// (or whenever a saved network can't be reached), the device puts up its
+// own "ESP32-Dashboard-Setup" AP with a captive portal; alongside the
+// normal SSID/password fields there's now a custom "Team Abbreviation"
+// field (WiFiManagerParameter), saved to flash (Preferences/NVS, not
+// WiFiManager's own storage - custom params aren't persisted
+// automatically the way SSID/password are) so it survives reboots. MQTT
+// topics are no longer the fixed "dashboard/standings"/"dashboard/roster"
+// - they're built at runtime from the saved team code
+// ("dashboard/PHI/standings" etc.) so multiple teams' data can share one
+// broker without devices seeing each other's team.
+//
+// Known limitation, not solved here: once WiFi + team are saved, the
+// portal only reopens if the saved WiFi fails to connect - there's no way
+// to change just the team later short of forcing a reconnect failure
+// (wrong password temporarily, router off, etc.) or re-flashing. Fine for
+// a first pass; a physical "hold button at boot to reconfigure" trigger
+// would be the natural follow-up if that turns out to matter.
+//
+// New library beyond what test_message_receiver.ino needed: WiFiManager
+// (by tzapu, via Library Manager). Preferences.h ships with the ESP32
+// core, no install needed.
+//
 // Still unverified like every .ino change here - flash and check: the
 // goalie table doesn't run past the clock box if the roster has more
 // goalies than expected, the clock actually shows correct Eastern time
 // (and flips correctly across a DST boundary, not verifiable until one
-// happens), and the new standings split doesn't clip the divider or the
-// title against the table.
+// happens), the new standings split doesn't clip the divider or the
+// title against the table, and (new in iteration 8) that the captive
+// portal's team field actually saves and survives a reboot, and that a
+// lowercase or blank entry doesn't wedge the topic names.
 
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <string.h>
 #include <time.h>
 
 TFT_eSPI tft = TFT_eSPI();
+Preferences prefs;
 
-const char* ssid     = "FREE WIFI";
-const char* password = "loljustkidding";
+// "PHI" is just the fallback if a device somehow ends up with no saved
+// team (shouldn't happen post-setup - saveTeamParam() below always writes
+// one) - not a "Flyers by default" statement beyond that.
+char teamCode[4] = "PHI";
+char standingsTopic[24];
+char rosterTopic[24];
 
 const char* mqtt_server = "192.168.1.78";
-const char* standings_topic = "dashboard/standings";
-const char* roster_topic    = "dashboard/roster";
+
+WiFiManagerParameter* teamParam;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -585,7 +622,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   // check, run after any future field additions) or PubSubClient
   // silently drops anything over the buffer instead of calling back
   // with a truncated one.
-  JsonDocument& target = (strcmp(topic, standings_topic) == 0) ? standingsDoc : rosterDoc;
+  JsonDocument& target = (strcmp(topic, standingsTopic) == 0) ? standingsDoc : rosterDoc;
   DeserializationError err = deserializeJson(target, payload, length);
   if (err) {
     Serial.print("JSON parse failed for ");
@@ -595,7 +632,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  if (strcmp(topic, standings_topic) == 0) {
+  if (strcmp(topic, standingsTopic) == 0) {
     haveStandings = true;
   } else {
     haveRoster = true;
@@ -604,8 +641,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
   // Redraw immediately only if this topic's screen is the one currently
   // showing - avoids interrupting whatever's on screen right now with an
   // update for the other screen.
-  if ((strcmp(topic, standings_topic) == 0 && currentScreen == SCREEN_STANDINGS) ||
-      (strcmp(topic, roster_topic) == 0 && (currentScreen == SCREEN_ROSTER || currentScreen == SCREEN_GOALIES))) {
+  if ((strcmp(topic, standingsTopic) == 0 && currentScreen == SCREEN_STANDINGS) ||
+      (strcmp(topic, rosterTopic) == 0 && (currentScreen == SCREEN_ROSTER || currentScreen == SCREEN_GOALIES))) {
     render();
   }
 }
@@ -613,12 +650,56 @@ void callback(char* topic, byte* payload, unsigned int length) {
 void reconnectMQTT() {
   while (!client.connected()) {
     if (client.connect("CYD-NHL-Dashboard")) {
-      client.subscribe(standings_topic);
-      client.subscribe(roster_topic);
+      client.subscribe(standingsTopic);
+      client.subscribe(rosterTopic);
     } else {
       delay(2000);
     }
   }
+}
+
+// --------------------------------------------------------------------
+// WiFiManager callbacks (see iteration 8 note up top).
+// --------------------------------------------------------------------
+
+// Fires when the portal's Save button is pressed - only happens if the
+// portal was actually shown (no saved WiFi, or a saved network failed to
+// connect). Every NHL team abbreviation is 3 letters, so entries are
+// uppercased and clamped to that; a blank submission leaves whatever was
+// already loaded/default alone rather than saving an empty team code.
+void saveTeamParam() {
+  String entered = teamParam->getValue();
+  entered.trim();
+  entered.toUpperCase();
+  if (entered.length() == 0) return;
+  strncpy(teamCode, entered.c_str(), 3);
+  teamCode[3] = '\0';
+  prefs.putString("team", teamCode);
+}
+
+// Fires the moment WiFiManager opens its own "ESP32-Dashboard-Setup" AP -
+// without this the screen would just sit on "Connecting WiFi..." while
+// actually waiting for a phone to join the AP and fill out the portal,
+// which looks identical to "stuck" from the outside.
+void configPortalStarted(WiFiManager* wmInstance) {
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 20);
+  tft.println("WiFi setup needed:");
+  tft.setTextSize(1);
+  tft.setCursor(10, 60);
+  tft.println("1. Connect phone to WiFi");
+  tft.setCursor(10, 76);
+  tft.println("   \"ESP32-Dashboard-Setup\"");
+  tft.setCursor(10, 96);
+  tft.println("2. A setup page should open");
+  tft.setCursor(10, 112);
+  tft.println("   (or visit 192.168.4.1)");
+  tft.setCursor(10, 128);
+  tft.println("3. Pick your WiFi + enter");
+  tft.setCursor(10, 144);
+  tft.println("   your team (e.g. PHI)");
 }
 
 void setup() {
@@ -644,26 +725,57 @@ void setup() {
   // behaving backwards on this specific panel batch).
   FLYERS_ORANGE = tft.color565(0x02, 0x49, 0xF7);
 
+  // Load whatever team was saved on a previous setup (defaults to the
+  // teamCode initializer, "PHI", the first time this ever runs on a
+  // fresh device) - this also becomes the captive portal's pre-filled
+  // value below, so re-running setup to change WiFi doesn't reset a
+  // team that was already chosen.
+  prefs.begin("dashboard", false);
+  String savedTeam = prefs.getString("team", teamCode);
+  savedTeam.trim();
+  savedTeam.toUpperCase();
+  if (savedTeam.length() > 0) {
+    strncpy(teamCode, savedTeam.c_str(), 3);
+    teamCode[3] = '\0';
+  }
+
   tft.fillScreen(TFT_WHITE);
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
   tft.setTextSize(2);
   tft.setCursor(10, 20);
   tft.println("Connecting WiFi...");
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    attempts++;
+  teamParam = new WiFiManagerParameter("team", "Team Abbreviation (e.g. PHI)", teamCode, 4);
+
+  WiFiManager wm;
+  wm.addParameter(teamParam);
+  wm.setSaveParamsCallback(saveTeamParam);
+  wm.setAPCallback(configPortalStarted);
+  // Give up and reboot (to try the whole thing again) rather than block
+  // forever with the AP up and nobody around to connect to it.
+  wm.setConfigPortalTimeout(180);
+
+  bool connected = wm.autoConnect("ESP32-Dashboard-Setup");
+
+  if (!connected) {
+    tft.fillScreen(TFT_WHITE);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(10, 20);
+    tft.println("WiFi setup timed out");
+    tft.setTextSize(1);
+    tft.setCursor(10, 50);
+    tft.println("Restarting to try again...");
+    delay(3000);
+    ESP.restart();
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    tft.fillScreen(TFT_WHITE);
-    tft.setCursor(10, 20);
-    tft.println("WiFi FAILED");
-    return;
-  }
+  // Built once here from whatever team ended up saved (either loaded
+  // above, or just written by saveTeamParam() if the portal was shown) -
+  // reconnectMQTT()/callback() below just reference these, never rebuild
+  // them, so a team change mid-runtime isn't possible without a reboot.
+  snprintf(standingsTopic, sizeof(standingsTopic), "dashboard/%s/standings", teamCode);
+  snprintf(rosterTopic, sizeof(rosterTopic), "dashboard/%s/roster", teamCode);
 
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
@@ -682,6 +794,17 @@ void setup() {
 }
 
 void loop() {
+  // Reconnect using the already-saved credentials on a transient drop -
+  // previously unnecessary on a single stable home network, but friends'
+  // networks are out of our control. Doesn't reopen the config portal;
+  // that only happens from setup() if a saved network can't be reached
+  // at boot.
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    delay(500);
+    return;
+  }
+
   if (!client.connected()) {
     reconnectMQTT();
   }
