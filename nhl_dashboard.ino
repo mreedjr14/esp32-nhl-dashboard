@@ -150,6 +150,7 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
@@ -167,11 +168,24 @@ char teamCode[4] = "PHI";
 char standingsTopic[24];
 char rosterTopic[24];
 
-const char* mqtt_server = "192.168.1.78";
+// HiveMQ Cloud cluster (replaces the old local-LAN broker at
+// 192.168.1.78, which friends' devices on their own networks can't
+// reach) - fill in from the cluster's overview page in the HiveMQ Cloud
+// console. mqtt_username/mqtt_password are the RESTRICTED, subscribe-only
+// credential set (ACL: subscribe on "dashboard/#" only, no publish) - not
+// dashboard_publish.py's publisher credentials. Safe to commit here even
+// though this repo is public: worst case if these leak is someone else
+// also subscribes to the same public standings/roster data, they can't
+// publish or read anything else.
+// TODO: fill in once the HiveMQ Cloud cluster exists.
+const char* mqtt_server = "YOUR-CLUSTER-ID.s2.eu.hivemq.cloud";
+const uint16_t mqtt_port = 8883;
+const char* mqtt_username = "TODO-restricted-subscriber-username";
+const char* mqtt_password = "TODO-restricted-subscriber-password";
 
 WiFiManagerParameter* teamParam;
 
-WiFiClient espClient;
+WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 // Flyers orange (Pantone 172C, f74902) - same color used for the "Flyers"
@@ -649,7 +663,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
 void reconnectMQTT() {
   while (!client.connected()) {
-    if (client.connect("CYD-NHL-Dashboard")) {
+    if (client.connect("CYD-NHL-Dashboard", mqtt_username, mqtt_password)) {
       client.subscribe(standingsTopic);
       client.subscribe(rosterTopic);
     } else {
@@ -777,7 +791,12 @@ void setup() {
   snprintf(standingsTopic, sizeof(standingsTopic), "dashboard/%s/standings", teamCode);
   snprintf(rosterTopic, sizeof(rosterTopic), "dashboard/%s/roster", teamCode);
 
-  client.setServer(mqtt_server, 1883);
+  // Encrypts the connection without pinning/bundling HiveMQ Cloud's CA
+  // certificate on-device - a reasonable tradeoff for a hobby display,
+  // not something to reuse anywhere handling sensitive data.
+  espClient.setInsecure();
+
+  client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
   client.setBufferSize(16384);  // see callback()'s comment - must fit the largest payload, with headroom
 
