@@ -1,0 +1,701 @@
+// NHL dashboard companion for the Pi - subscribes to two retained MQTT
+// topics (Flyers division standings + a compact stat card per roster
+// player, both published by bots/alerts/pollers/dashboard_publish.py
+// every ~20 min) and cycles between/within them entirely on its own
+// timer. The ESP32 never talks to NHL's API itself - it only ever shows
+// whatever it last received, same "subscribe and render" shape as
+// test_message_receiver.ino, just parsing structured JSON instead of a
+// raw string and cycling through multiple screens instead of showing one.
+//
+// Needs one extra library beyond test_message_receiver.ino's set (all via
+// Arduino IDE's Library Manager): ArduinoJson (by Benoit Blanchon).
+// Written against ArduinoJson v7's JsonDocument API - if the Library
+// Manager installs a v6.x release instead, replace every `JsonDocument`
+// below with `DynamicJsonDocument standingsDoc(2048)` (and 4096 for the
+// roster one) - v6 sizes documents up front instead of growing them
+// automatically.
+//
+// NOT compiled/verified here - no Arduino toolchain available in this
+// environment (unlike every Python change this project, which got
+// actually run before being called done). Flash this and see what
+// breaks; the WiFi/MQTT/TFT setup boilerplate is copied as-is from your
+// already-working test_message_receiver.ino, so that part should be
+// solid, but the JSON parsing and rendering are new and untested.
+//
+// Iteration 2 (color fix + shot_range/best_stat fields): confirmed fixed
+// live - the color swap theory in FLYERS_ORANGE's comment was correct,
+// player name and standings' PHI row both render actual orange now.
+//
+// Iteration 3 (mini shot heat map): confirmed working live - the
+// two-column skater layout (stats left, heat map right) renders
+// correctly, screen really was 320x240 with room to spare as the
+// User_Setup.h check predicted.
+//
+// Iteration 4 (full Edge data dump): removed the single "best in the
+// league" footer entirely - every Edge metric (renderEdgeList, up to 4
+// skaters/5 goalies) is shown now, not just the best one, plus zone time
+// by strength and zone starts for skaters (both new, previously 100%
+// unused data per stats_api.py). Shot range and the heat map are
+// UNCHANGED from iteration 3 per explicit request.
+//
+// Iteration 5 (white/orange reskin, full-height rink): full visual
+// redo of the player card per explicit request. Background is white,
+// text black, decorative lines Flyers orange everywhere (not just the
+// player name) - fillScreen/setTextColor calls throughout were flipped
+// accordingly, including the standings screen and the boot-time
+// WiFi-status messages, for a consistent look across every screen this
+// thing shows. Player name now explicitly splits "First Last" onto two
+// lines instead of relying on println's auto-wrap. The dense
+// edge/zone_time/zone_starts/shot_range dump from iteration 4 is gone -
+// "I just want to do some stats" below the name now means exactly two
+// line-aware header+value pairs (GP/G/A/P/TOI, then #/Pos/Age for
+// skaters; Record/GAA/SV%/TOI then #/Pos/Age for goalies) and nothing
+// else. renderEdgeList/ordinalSuffix are removed as dead code - the
+// payload still carries edge/zone_time/zone_starts/shot_range fields
+// (dashboard_publish.py wasn't touched, only what's rendered here), so
+// nothing breaks if a future screen wants them back.
+//
+// The shot map is now the entire right half of the screen (was a
+// ~142x114 box in the corner) and draws an actual half-rink schematic -
+// rounded boards, goal line, a goal (posts), blue line, and the two
+// offensive-zone faceoff circles/dots, all in Flyers orange, using the
+// same ZONE_X/ZONE_Y table the heat dots already used so everything
+// lines up. Heat dot color is now a real blue->cyan->green->yellow->red
+// gradient driven by shot volume (same ratio that already drove dot
+// size) via the new heatColor()/rgbColor() helpers, replacing the old
+// TFT_RED/TFT_YELLOW/TFT_BLUE percentile coloring - those are plain
+// RGB565 literals that never got the R/B-swap compensation FLYERS_ORANGE
+// needed (see its comment in setup()), so "red" was almost certainly
+// rendering blue-ish on the real panel - exactly the "blue looks like
+// the highest value" symptom reported after seeing this live, and the
+// reason for this rewrite.
+//
+// Iteration 6 (bigger/reorganized stats, after seeing iteration 5 live):
+// the rink diagram, R/B-swap fix, and reskin all confirmed working
+// exactly as intended on the real panel. Only the stat text needed
+// another pass - it was still size1 while everything else went bigger,
+// and read small/cramped. Now: name is black (not orange - orange is
+// reserved for the rink and the two new divider lines between
+// name/stats and stats/bio), and the header+value row pairs from
+// iteration 5 are gone in favor of one size2 line per stat group with
+// inline labels (G18 A37 P55, then GP90 <TOI> on its own line per
+// explicit request) - a separate header row would've cost as much
+// vertical space as a third stat line at this size. Skaters keep TOI
+// unlabeled (squeezed against the rink, ~150px before it starts);
+// goalies get the full "TOI" label since they have the whole width free.
+//
+// Iteration 6 confirmed working live too - reskin, sizing, and dividers
+// all landed as intended.
+//
+// Iteration 7 (goalie table, corner clock, standings relayout): three
+// more explicit requests. Goalies no longer get individual cards in the
+// SCREEN_ROSTER cycle - skaterCount() relies on dashboard_publish.py
+// always appending goalies after forwards/defensemen (never interleaved)
+// to find where skaters end, and SCREEN_GOALIES (new enum value) shows
+// all of them at once in a table (name/#/age/gp/sv%/gaa) after the last
+// skater card, before looping back to standings. A small clock box
+// (black text, Flyers-orange border) now sits bottom-left on every
+// screen - configTzTime() with a US-Eastern POSIX TZ string
+// ("EST5EDT,M3.2.0,M11.1.0") handles EST/EDT DST switching automatically
+// via the standard C time API (time()/localtime_r()), no manual offset math;
+// it needs its own NTP reachability (independent of the Pi/MQTT side)
+// and reads as the 1970 epoch until that first sync completes, so
+// renderClock() no-ops until time(nullptr) looks like a real timestamp.
+// It repaints on every full screen render plus its own ~1s tick in
+// loop() so it doesn't go stale for an entire 15s slide. Standings is
+// now a left/right split - a big "NHL / Standings" title occupies the
+// left half (freed up by dropping the table to team/gp/pts only, per
+// explicit request to make room), the table itself moved to the right
+// half, with a new vertical orange divider between them; gp is derived
+// client-side (wins+losses+ot_losses) since the payload never carried
+// it as its own field.
+//
+// Still unverified like every .ino change here - flash and check: the
+// goalie table doesn't run past the clock box if the roster has more
+// goalies than expected, the clock actually shows correct Eastern time
+// (and flips correctly across a DST boundary, not verifiable until one
+// happens), and the new standings split doesn't clip the divider or the
+// title against the table.
+
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <string.h>
+#include <time.h>
+
+TFT_eSPI tft = TFT_eSPI();
+
+const char* ssid     = "FREE WIFI";
+const char* password = "loljustkidding";
+
+const char* mqtt_server = "192.168.1.78";
+const char* standings_topic = "dashboard/standings";
+const char* roster_topic    = "dashboard/roster";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Flyers orange (Pantone 172C, f74902) - same color used for the "Flyers"
+// preset elsewhere in this project (mikes_automations' /lights command).
+uint16_t FLYERS_ORANGE;
+
+// --------------------------------------------------------------------
+// Cached data - updated whenever a retained (or new) message arrives on
+// either topic. Screen cycling below always renders from these, never
+// re-parses anything mid-render, so a message arriving mid-draw can't
+// tear a screen in half - it just takes effect next time that screen
+// comes back around.
+// --------------------------------------------------------------------
+JsonDocument standingsDoc;
+JsonDocument rosterDoc;
+bool haveStandings = false;
+bool haveRoster = false;
+
+enum Screen { SCREEN_STANDINGS, SCREEN_ROSTER, SCREEN_GOALIES };
+Screen currentScreen = SCREEN_STANDINGS;
+unsigned long screenChangedAt = 0;
+int rosterIndex = 0;
+
+const unsigned long STANDINGS_DURATION_MS   = 15000;
+const unsigned long PLAYER_CARD_DURATION_MS = 15000;
+
+// --------------------------------------------------------------------
+// Rendering
+// --------------------------------------------------------------------
+
+void renderStandings() {
+  tft.fillScreen(TFT_WHITE);
+
+  // Left half: a big two-line title filling the space freed up by
+  // trimming the table on the right to 3 columns (per explicit request -
+  // this side-by-side layout only fits with the row down to team/gp/pts).
+  tft.setTextSize(3);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setCursor(8, 70);
+  tft.println("NHL");
+  tft.setTextSize(2);
+  tft.setCursor(8, 112);
+  tft.println("Standings");
+
+  tft.drawFastVLine(160, 0, 240, FLYERS_ORANGE);
+  tft.drawFastVLine(161, 0, 240, FLYERS_ORANGE);
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+
+  if (!haveStandings) {
+    tft.setCursor(168, 8);
+    tft.println("Waiting for data...");
+    return;
+  }
+
+  char hdr[20];
+  snprintf(hdr, sizeof(hdr), "%-6s%-5s%-5s", "Team", "GP", "Pts");
+  tft.setCursor(168, 8);
+  tft.println(hdr);
+
+  JsonArray rows = standingsDoc["rows"].as<JsonArray>();
+  int y = 26;
+  for (JsonObject row : rows) {
+    bool isTeam = row["is_team"];
+    tft.setTextColor(isTeam ? FLYERS_ORANGE : TFT_BLACK, TFT_WHITE);
+    tft.setCursor(168, y);
+
+    const char* abbrev = row["abbrev"];
+    int wins = row["wins"];
+    int losses = row["losses"];
+    int otLosses = row["ot_losses"];
+    int points = row["points"];
+    int gp = wins + losses + otLosses;  // not a payload field - cheap enough to derive here
+
+    char line[20];
+    snprintf(line, sizeof(line), "%-6s%-5d%-5d", abbrev, gp, points);
+    tft.println(line);
+    y += 20;
+  }
+}
+
+// Bottom-left clock box, present on every screen (called once from
+// render() on any screen change, and again every ~1s from loop() so it
+// stays live without repainting the whole screen behind it - see
+// loop()). configTzTime() in setup() keeps time(nullptr)/localtime_r()
+// auto-adjusted for Eastern (EST/EDT); time(nullptr) reads as the 1970
+// epoch until NTP has synced, so nothing is drawn until it looks like a
+// real timestamp rather than show a nonsense "8:00 PM" at boot.
+bool timeIsSynced() {
+  return time(nullptr) > 1700000000;  // sometime after Nov 2023
+}
+
+void renderClock() {
+  if (!timeIsSynced()) return;
+
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  char buf[12];
+  strftime(buf, sizeof(buf), "%I:%M %p", &timeinfo);
+  const char* text = (buf[0] == '0') ? buf + 1 : buf;  // trim the leading zero on the hour
+
+  const int x0 = 4, y0 = 216, w = 68, h = 20;
+  tft.fillRect(x0, y0, w, h, TFT_WHITE);
+  tft.drawRect(x0, y0, w, h, FLYERS_ORANGE);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setCursor(x0 + 5, y0 + 6);
+  tft.print(text);
+}
+
+// Same 17 named ice zones and (x, y) rink coordinates (0-100 scale, net
+// at top) as card_image.py's ZONE_COORDS / dashboard_publish.py's
+// ZONE_ORDER, in the exact same order - the "heat" payload field sends
+// just an index into this table per zone rather than a name and two
+// coordinates, since this end already has all three (see
+// dashboard_publish.py's build_edge_extras for the payload-size math).
+const uint8_t ZONE_X[17] = {50, 50, 35, 65, 50, 13, 87, 50, 23, 77, 11, 89, 19, 81, 50, 50, 50};
+const uint8_t ZONE_Y[17] = { 9, 20, 19, 19, 32, 13, 13, 47, 37, 37, 51, 51, 68, 68, 72, 88, 98};
+
+// This panel renders color565()'s R and B bytes swapped relative to what
+// the library assumes (confirmed via FLYERS_ORANGE below - a hand-picked
+// orange came out blue until its R/B bytes were fed in swapped). That fix
+// only ever got applied to FLYERS_ORANGE itself - the heat map's old
+// TFT_RED/TFT_YELLOW/TFT_BLUE percentile coloring used the library's
+// plain (uncompensated) named constants, so "red" was almost certainly
+// rendering blue-ish on the real screen. rgbColor() applies the same
+// swap to any hand-picked hue so it actually comes out as intended here.
+uint16_t rgbColor(uint8_t r, uint8_t g, uint8_t b) {
+  return tft.color565(b, g, r);
+}
+
+// blue -> cyan -> green -> yellow -> red, t=0..1 (least to most shots) -
+// a real heat gradient in place of the old three-color percentile
+// coding, so the biggest/reddest dot is unambiguously "the most", not
+// dependent on remembering what each of three fixed colors meant.
+uint16_t heatColor(float t) {
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  uint8_t r, g, b;
+  if (t < 0.25) {
+    float u = t / 0.25;
+    r = 0; g = (uint8_t)(u * 255); b = 255;
+  } else if (t < 0.5) {
+    float u = (t - 0.25) / 0.25;
+    r = 0; g = 255; b = (uint8_t)((1 - u) * 255);
+  } else if (t < 0.75) {
+    float u = (t - 0.5) / 0.25;
+    r = (uint8_t)(u * 255); g = 255; b = 0;
+  } else {
+    float u = (t - 0.75) / 0.25;
+    r = 255; g = (uint8_t)((1 - u) * 255); b = 0;
+  }
+  return rgbColor(r, g, b);
+}
+
+// zx/zy on the 0-100 ZONE_X/ZONE_Y scale -> actual screen pixels within
+// a box at (bx, by, bw, bh).
+int zonePx(int zx, int bx, int bw) { return bx + (zx * bw) / 100; }
+int zonePy(int zy, int by, int bh) { return by + (zy * bh) / 100; }
+
+// Half-rink schematic (net at top, down through the neutral-zone edge) -
+// boards, goal line, a goal (posts), the blue line, and the two
+// offensive-zone faceoff circles/dots, all decorative/orientation-only
+// (not data-driven) and drawn in Flyers orange per explicit request.
+// Uses the same ZONE_X/ZONE_Y table the heat dots use (indices 0, 8-11)
+// so the circles land exactly where "L Circle"/"R Circle" shots plot.
+void renderRink(int x0, int y0, int w, int h) {
+  int bx = x0 + 4, by = y0 + 4, bw = w - 8, bh = h - 8;
+  tft.drawRoundRect(bx, by, bw, bh, 24, FLYERS_ORANGE);
+
+  // Goal line, just past the net.
+  int goalLineY = zonePy(15, by, bh);
+  tft.drawFastHLine(zonePx(12, bx, bw), goalLineY, zonePx(88, bx, bw) - zonePx(12, bx, bw), FLYERS_ORANGE);
+
+  // Net (goal posts) straddling the goal line.
+  int netX = zonePx(42, bx, bw);
+  int netY = zonePy(5, by, bh);
+  int netW = zonePx(58, bx, bw) - netX;
+  int netH = zonePy(15, by, bh) - netY;
+  tft.drawRect(netX, netY, netW, netH, FLYERS_ORANGE);
+
+  // Blue line.
+  tft.drawFastHLine(bx, zonePy(ZONE_Y[12], by, bh), bw, FLYERS_ORANGE);
+
+  // Offensive-zone faceoff circles (indices 8, 9 = L Circle, R Circle).
+  int circleR = bw / 6;
+  for (int idx = 8; idx <= 9; idx++) {
+    int cx = zonePx(ZONE_X[idx], bx, bw);
+    int cy = zonePy(ZONE_Y[idx], by, bh);
+    tft.drawCircle(cx, cy, circleR, FLYERS_ORANGE);
+    tft.fillCircle(cx, cy, 2, FLYERS_ORANGE);
+  }
+
+  // Neutral-zone faceoff dots (indices 10, 11 = Outside L, Outside R).
+  tft.fillCircle(zonePx(ZONE_X[10], bx, bw), zonePy(ZONE_Y[10], by, bh), 3, FLYERS_ORANGE);
+  tft.fillCircle(zonePx(ZONE_X[11], bx, bw), zonePy(ZONE_Y[11], by, bh), 3, FLYERS_ORANGE);
+}
+
+// One dot per zone this player has shot from, sized and colored by shot
+// volume relative to their own max (not league-wide - this is "where
+// THIS player shoots from", not an absolute-volume heat map).
+void renderHeatDots(JsonArray heat, int x0, int y0, int w, int h) {
+  int bx = x0 + 4, by = y0 + 4, bw = w - 8, bh = h - 8;
+
+  int maxShots = 1;
+  for (JsonArray entry : heat) {
+    int shots = entry[1];
+    if (shots > maxShots) maxShots = shots;
+  }
+
+  int maxRadius = bw / 11;
+  for (JsonArray entry : heat) {
+    int idx = entry[0];
+    if (idx < 0 || idx > 16) continue;  // defensive - see build_edge_extras, shouldn't happen
+    int shots = entry[1];
+
+    int cx = zonePx(ZONE_X[idx], bx, bw);
+    int cy = zonePy(ZONE_Y[idx], by, bh);
+    int radius = 3 + (shots * (maxRadius - 3)) / maxShots;
+    tft.fillCircle(cx, cy, radius, heatColor((float)shots / maxShots));
+  }
+}
+
+void renderPlayerCard() {
+  tft.fillScreen(TFT_WHITE);
+
+  if (!haveRoster) {
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setCursor(8, 6);
+    tft.println("Waiting for roster data...");
+    return;
+  }
+
+  JsonArray players = rosterDoc["players"].as<JsonArray>();
+  if (players.size() == 0) {
+    return;
+  }
+  // rosterIndex is kept in range by advanceScreen() below, not here -
+  // this just renders whatever index it's currently pointed at.
+  JsonObject p = players[rosterIndex];
+
+  const char* name = p["name"];
+  const char* position = p["position"];
+  int number = p["number"].is<int>() ? p["number"].as<int>() : 0;
+  int age = p["age"].is<int>() ? p["age"].as<int>() : 0;
+
+  // "toi" is already formatted as an M:SS string server-side (see
+  // providers/nhl.py's get_compact_player_stats) - just display it, no
+  // parsing needed on this end. Absent/older cached payloads (from before
+  // this field existed) fall back to "n/a" via the "| default" idiom,
+  // same as how the Pi side formats a genuinely missing value.
+  const char* toi = p["toi"] | "n/a";
+
+  // "First Last" -> two lines, name staying at the same (8, 4) spot it
+  // always has, last name explicitly on its own line instead of relying
+  // on println's auto-wrap. Splits on the first space; NHL rosters don't
+  // currently have a multi-word first name, so nothing more elaborate is
+  // needed here.
+  char firstName[24] = "";
+  char lastName[24] = "";
+  const char* space = strchr(name, ' ');
+  if (space) {
+    size_t firstLen = space - name;
+    if (firstLen >= sizeof(firstName)) firstLen = sizeof(firstName) - 1;
+    memcpy(firstName, name, firstLen);
+    firstName[firstLen] = '\0';
+    strncpy(lastName, space + 1, sizeof(lastName) - 1);
+    lastName[sizeof(lastName) - 1] = '\0';
+  } else {
+    strncpy(firstName, name, sizeof(firstName) - 1);
+  }
+
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setCursor(8, 4);
+  tft.println(firstName);
+  tft.setCursor(8, 26);
+  tft.println(lastName);
+
+  // Divider lines (name/stats, stats/bio), left column only so they
+  // don't cut across the rink diagram's own top border for skaters -
+  // 2px thick (two adjacent 1px lines) to read clearly at this size.
+  const int DIVIDER_X0 = 4, DIVIDER_X1 = 156;
+  tft.drawFastHLine(DIVIDER_X0, 46, DIVIDER_X1 - DIVIDER_X0, FLYERS_ORANGE);
+  tft.drawFastHLine(DIVIDER_X0, 47, DIVIDER_X1 - DIVIDER_X0, FLYERS_ORANGE);
+
+  // Two stat lines, values inline with a short label each (no separate
+  // header row - at this text size a header row would cost as much
+  // vertical space as a third stat line) - GP/TOI (participation) on
+  // their own line per explicit request, G/A/P (performance) above it.
+  // TOI goes unlabeled - squeezed against the rink diagram (only ~150px
+  // before it starts), and its M:SS format is self-evident right next to GP.
+  int gp = p["gp"], g = p["g"], a = p["a"], pts = p["p"];
+
+  char line1[20], line2[20];
+  snprintf(line1, sizeof(line1), "G%d A%d P%d", g, a, pts);
+  snprintf(line2, sizeof(line2), "GP%d  %s", gp, toi);
+  tft.setCursor(8, 54);
+  tft.println(line1);
+  tft.setCursor(8, 76);
+  tft.println(line2);
+
+  tft.drawFastHLine(DIVIDER_X0, 98, DIVIDER_X1 - DIVIDER_X0, FLYERS_ORANGE);
+  tft.drawFastHLine(DIVIDER_X0, 99, DIVIDER_X1 - DIVIDER_X0, FLYERS_ORANGE);
+
+  char bioLine[20];
+  snprintf(bioLine, sizeof(bioLine), "#%d %s %d", number, position, age);
+  tft.setCursor(8, 106);
+  tft.println(bioLine);
+
+  // Shot map: the entire right half of the screen. SCREEN_ROSTER only
+  // ever indexes skaters now (see skaterCount()) - goalies get their own
+  // table screen (renderGoalieTable()) instead, since they have no
+  // shot-location Edge data to map anyway.
+  renderRink(160, 0, 160, 240);
+  if (p["heat"].is<JsonArray>()) {
+    renderHeatDots(p["heat"].as<JsonArray>(), 160, 0, 160, 240);
+  }
+}
+
+// All goalies at once (name, #, age, gp, sv%, gaa) instead of cycling
+// them individually through renderPlayerCard() like skaters, per
+// explicit request - SCREEN_ROSTER no longer indexes goalies at all
+// (see skaterCount()), this table is the only place they appear.
+void renderGoalieTable() {
+  tft.fillScreen(TFT_WHITE);
+
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setCursor(8, 6);
+  tft.println("Goalies");
+
+  tft.drawFastHLine(8, 30, 304, FLYERS_ORANGE);
+  tft.drawFastHLine(8, 31, 304, FLYERS_ORANGE);
+
+  if (!haveRoster) {
+    tft.setTextSize(1);
+    tft.setCursor(8, 40);
+    tft.println("Waiting for roster data...");
+    return;
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  char hdr[40];
+  snprintf(hdr, sizeof(hdr), "%-16s%-4s%-5s%-4s%-7s%-5s", "Name", "#", "Age", "GP", "SV%", "GAA");
+  tft.setCursor(8, 40);
+  tft.println(hdr);
+
+  int y = 56;
+  for (JsonObject p : rosterDoc["players"].as<JsonArray>()) {
+    if (!p["w"].is<int>()) continue;  // skaters - this screen is goalies only
+
+    const char* name = p["name"];
+    int number = p["number"].is<int>() ? p["number"].as<int>() : 0;
+    int age = p["age"].is<int>() ? p["age"].as<int>() : 0;
+    int gp = p["gp"];
+    float svp = p["svp"];
+    float gaa = p["gaa"];
+
+    char line[40];
+    snprintf(line, sizeof(line), "%-16.16s%-4d%-5d%-4d%-7.3f%-5.2f", name, number, age, gp, svp, gaa);
+    tft.setCursor(8, y);
+    tft.println(line);
+    y += 16;
+  }
+}
+
+void render() {
+  if (currentScreen == SCREEN_STANDINGS) {
+    renderStandings();
+  } else if (currentScreen == SCREEN_ROSTER) {
+    renderPlayerCard();
+  } else {
+    renderGoalieTable();
+  }
+  renderClock();
+}
+
+// dashboard_publish.py's build_roster_payload() always appends goalies
+// after forwards/defensemen, never interleaved - so "index of the first
+// goalie" is the same as "count of skaters", no separate flag needed per
+// entry. Used to keep SCREEN_ROSTER's cycle skater-only (goalies get
+// their own table screen instead - see renderGoalieTable()).
+int skaterCount() {
+  JsonArray players = rosterDoc["players"].as<JsonArray>();
+  int i = 0;
+  for (JsonObject p : players) {
+    if (p["w"].is<int>()) break;
+    i++;
+  }
+  return i;
+}
+
+// --------------------------------------------------------------------
+// Screen cycling - standings, then each skater in turn, then the goalie
+// table, then back to standings. All local timing, no dependency on the
+// Pi's publish schedule - see this file's header comment.
+// --------------------------------------------------------------------
+
+void advanceScreen() {
+  unsigned long now = millis();
+
+  if (currentScreen == SCREEN_STANDINGS) {
+    if (now - screenChangedAt < STANDINGS_DURATION_MS) return;
+    currentScreen = SCREEN_ROSTER;
+    rosterIndex = 0;
+    screenChangedAt = now;
+    render();
+    return;
+  }
+
+  if (currentScreen == SCREEN_ROSTER) {
+    if (now - screenChangedAt < PLAYER_CARD_DURATION_MS) return;
+
+    int total = haveRoster ? rosterDoc["players"].as<JsonArray>().size() : 0;
+    int skaters = haveRoster ? skaterCount() : 0;
+    rosterIndex++;
+    if (rosterIndex >= skaters) {
+      rosterIndex = 0;
+      currentScreen = (skaters < total) ? SCREEN_GOALIES : SCREEN_STANDINGS;
+    }
+    screenChangedAt = now;
+    render();
+    return;
+  }
+
+  // SCREEN_GOALIES
+  if (now - screenChangedAt < PLAYER_CARD_DURATION_MS) return;
+  currentScreen = SCREEN_STANDINGS;
+  rosterIndex = 0;
+  screenChangedAt = now;
+  render();
+}
+
+// --------------------------------------------------------------------
+// MQTT - same connect/subscribe/reconnect shape as test_message_receiver.ino,
+// just two topics and a JSON callback instead of one topic and a raw string.
+// --------------------------------------------------------------------
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  // setBufferSize() below must be >= the largest payload this ever
+  // receives (roster was ~10.5KB once heat map data was added, standings
+  // ~1KB - see bots/alerts/pollers/dashboard_publish.py's own size
+  // check, run after any future field additions) or PubSubClient
+  // silently drops anything over the buffer instead of calling back
+  // with a truncated one.
+  JsonDocument& target = (strcmp(topic, standings_topic) == 0) ? standingsDoc : rosterDoc;
+  DeserializationError err = deserializeJson(target, payload, length);
+  if (err) {
+    Serial.print("JSON parse failed for ");
+    Serial.print(topic);
+    Serial.print(": ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  if (strcmp(topic, standings_topic) == 0) {
+    haveStandings = true;
+  } else {
+    haveRoster = true;
+  }
+
+  // Redraw immediately only if this topic's screen is the one currently
+  // showing - avoids interrupting whatever's on screen right now with an
+  // update for the other screen.
+  if ((strcmp(topic, standings_topic) == 0 && currentScreen == SCREEN_STANDINGS) ||
+      (strcmp(topic, roster_topic) == 0 && (currentScreen == SCREEN_ROSTER || currentScreen == SCREEN_GOALIES))) {
+    render();
+  }
+}
+
+void reconnectMQTT() {
+  while (!client.connected()) {
+    if (client.connect("CYD-NHL-Dashboard")) {
+      client.subscribe(standings_topic);
+      client.subscribe(roster_topic);
+    } else {
+      delay(2000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  tft.init();
+  tft.setRotation(1);
+  tft.invertDisplay(0);
+
+  // Was tft.color565(0xF7, 0x49, 0x02) (Flyers orange, RGB order) and
+  // rendered as blue instead. White/black/green text all looked correct
+  // before this, but those three are the one set of colors that would
+  // look "correct" whether or not red/blue are swapped (grayscale is
+  // unaffected, and green isn't involved in an R/B swap) - so they never
+  // actually proved the panel's color order matched what color565()
+  // assumes, they just never disproved it either. A custom color with
+  // meaningfully different R and B components (this one) was the first
+  // real test, and it came back visibly wrong. Feeding the R and B bytes
+  // in swapped is the standard fix for exactly this symptom on BGR-order
+  // panels - if this is STILL not orange after reflashing, the swap
+  // theory is wrong and it's something else (possibly invertDisplay()
+  // behaving backwards on this specific panel batch).
+  FLYERS_ORANGE = tft.color565(0x02, 0x49, 0xF7);
+
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 20);
+  tft.println("Connecting WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    tft.fillScreen(TFT_WHITE);
+    tft.setCursor(10, 20);
+    tft.println("WiFi FAILED");
+    return;
+  }
+
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  client.setBufferSize(16384);  // see callback()'s comment - must fit the largest payload, with headroom
+
+  // Eastern time (auto DST-adjusted between EST/EDT) for the bottom-left
+  // clock box on every screen - see renderClock(). Independent of the
+  // Pi/MQTT side entirely, just needs this network's own internet access
+  // to reach an NTP server.
+  configTzTime("EST5EDT,M3.2.0,M11.1.0", "pool.ntp.org", "time.nist.gov");
+
+  reconnectMQTT();
+
+  screenChangedAt = millis();
+  render();
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+  advanceScreen();
+
+  // Redraw just the clock box every ~1s, independent of whatever screen
+  // is showing - advanceScreen()/render() only repaint the clock as a
+  // side effect of a full screen change (every 15s) or new MQTT data,
+  // which would otherwise leave it up to 15s stale.
+  static unsigned long lastClockTick = 0;
+  unsigned long now = millis();
+  if (now - lastClockTick >= 1000) {
+    lastClockTick = now;
+    renderClock();
+  }
+}
