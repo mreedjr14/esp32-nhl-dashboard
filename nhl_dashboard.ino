@@ -138,14 +138,32 @@
 // (by tzapu, via Library Manager). Preferences.h ships with the ESP32
 // core, no install needed.
 //
+// Iteration 9 (portal-configurable time zone + 12h/24h format): the
+// clock box was hardcoded to Eastern/12h-with-AM/PM, fine when this was
+// one device on one desk, not fine once friends in other zones (one
+// explicitly wants 24h/military time) are involved. Two more
+// WiFiManagerParameter fields join the team one from iteration 8 - a
+// time zone abbreviation (ET/CT/MT/PT/AT, looked up against POSIX TZ
+// strings in TZ_TABLE rather than asking anyone to type
+// "EST5EDT,M3.2.0,M11.1.0" themselves) and a 12/24 format flag - both
+// saved to the same Preferences namespace as team, both defaulting to
+// "ET"/"12" (this sketch's original hardcoded behavior) if unset or
+// invalid. All three fields now save from one saveConfigParams()
+// callback - WiFiManager only supports registering a single
+// setSaveParamsCallback.
+//
 // Still unverified like every .ino change here - flash and check: the
 // goalie table doesn't run past the clock box if the roster has more
-// goalies than expected, the clock actually shows correct Eastern time
-// (and flips correctly across a DST boundary, not verifiable until one
-// happens), the new standings split doesn't clip the divider or the
-// title against the table, and (new in iteration 8) that the captive
-// portal's team field actually saves and survives a reboot, and that a
-// lowercase or blank entry doesn't wedge the topic names.
+// goalies than expected, the clock actually shows correct time for
+// whatever zone was entered (and flips correctly across a DST boundary,
+// not verifiable until one happens), the new standings split doesn't
+// clip the divider or the title against the table, that the captive
+// portal's team field actually saves and survives a reboot, that a
+// lowercase or blank entry doesn't wedge the topic names, and (new in
+// iteration 9) that an invalid time zone entry falls back to ET instead
+// of silently breaking configTzTime(), and that 24h format actually
+// renders as "HH:MM" rather than still trimming a leading zero meant
+// only for 12h hours.
 
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -162,11 +180,43 @@ TFT_eSPI tft = TFT_eSPI();
 Preferences prefs;
 
 // "PHI" is just the fallback if a device somehow ends up with no saved
-// team (shouldn't happen post-setup - saveTeamParam() below always writes
-// one) - not a "Flyers by default" statement beyond that.
+// team (shouldn't happen post-setup - saveConfigParams() below always
+// writes one) - not a "Flyers by default" statement beyond that.
 char teamCode[4] = "PHI";
 char standingsTopic[24];
 char rosterTopic[24];
+
+// Time zone abbreviation + display format, both portal-configurable
+// (iteration 9) so a friend in a different zone, or one who wants 24h
+// instead of 12h AM/PM, doesn't need a firmware change - see
+// renderClock() and setup()'s configTzTime() call. "ET"/"12" match the
+// original hardcoded Eastern/12h behavior, so an unrecognized or blank
+// entry falls back to exactly what this sketch always did before.
+char tzAbbrev[4] = "ET";
+char timeFormat[4] = "12";
+
+struct TzEntry { const char* abbrev; const char* posix; };
+
+// POSIX TZ strings (see setup()'s original comment on why - auto DST via
+// the standard C time API, no manual offset math). Covers the mainland
+// US/Canada zones an NHL-fan friend group is likely spread across; add
+// entries here (and to the portal's field hint below) if that's ever not
+// enough.
+const TzEntry TZ_TABLE[] = {
+  {"ET", "EST5EDT,M3.2.0,M11.1.0"},
+  {"CT", "CST6CDT,M3.2.0,M11.1.0"},
+  {"MT", "MST7MDT,M3.2.0,M11.1.0"},
+  {"PT", "PST8PDT,M3.2.0,M11.1.0"},
+  {"AT", "AST4ADT,M3.2.0,M11.1.0"},
+};
+const int TZ_TABLE_LEN = sizeof(TZ_TABLE) / sizeof(TZ_TABLE[0]);
+
+const char* posixTzFor(const char* abbrev) {
+  for (int i = 0; i < TZ_TABLE_LEN; i++) {
+    if (strcmp(TZ_TABLE[i].abbrev, abbrev) == 0) return TZ_TABLE[i].posix;
+  }
+  return nullptr;
+}
 
 // HiveMQ Cloud cluster (replaces the old local-LAN broker at
 // 192.168.1.78, which friends' devices on their own networks can't
@@ -178,12 +228,14 @@ char rosterTopic[24];
 // also subscribes to the same public standings/roster data, they can't
 // publish or read anything else.
 // TODO: fill in once the HiveMQ Cloud cluster exists.
-const char* mqtt_server = "YOUR-CLUSTER-ID.s2.eu.hivemq.cloud";
+const char* mqtt_server = "52d35eeb56c24538a0883b18917b1ee8.s1.eu.hivemq.cloud";
 const uint16_t mqtt_port = 8883;
 const char* mqtt_username = "TODO-restricted-subscriber-username";
 const char* mqtt_password = "TODO-restricted-subscriber-password";
 
 WiFiManagerParameter* teamParam;
+WiFiManagerParameter* tzParam;
+WiFiManagerParameter* timeFormatParam;
 
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
@@ -272,9 +324,10 @@ void renderStandings() {
 // render() on any screen change, and again every ~1s from loop() so it
 // stays live without repainting the whole screen behind it - see
 // loop()). configTzTime() in setup() keeps time(nullptr)/localtime_r()
-// auto-adjusted for Eastern (EST/EDT); time(nullptr) reads as the 1970
-// epoch until NTP has synced, so nothing is drawn until it looks like a
-// real timestamp rather than show a nonsense "8:00 PM" at boot.
+// auto-adjusted for whichever zone got saved (see TZ_TABLE); time(nullptr)
+// reads as the 1970 epoch until NTP has synced, so nothing is drawn until
+// it looks like a real timestamp rather than show a nonsense "8:00 PM" at
+// boot.
 bool timeIsSynced() {
   return time(nullptr) > 1700000000;  // sometime after Nov 2023
 }
@@ -286,8 +339,15 @@ void renderClock() {
   struct tm timeinfo;
   localtime_r(&now, &timeinfo);
   char buf[12];
-  strftime(buf, sizeof(buf), "%I:%M %p", &timeinfo);
-  const char* text = (buf[0] == '0') ? buf + 1 : buf;  // trim the leading zero on the hour
+  bool military = (strcmp(timeFormat, "24") == 0);
+  if (military) {
+    strftime(buf, sizeof(buf), "%H:%M", &timeinfo);
+  } else {
+    strftime(buf, sizeof(buf), "%I:%M %p", &timeinfo);
+  }
+  // Leading-zero trim only makes sense for 12h hours (24h's "08:00" is
+  // the correct/expected form, not a leading zero to strip).
+  const char* text = (!military && buf[0] == '0') ? buf + 1 : buf;
 
   const int x0 = 4, y0 = 216, w = 68, h = 20;
   tft.fillRect(x0, y0, w, h, TFT_WHITE);
@@ -681,14 +741,37 @@ void reconnectMQTT() {
 // connect). Every NHL team abbreviation is 3 letters, so entries are
 // uppercased and clamped to that; a blank submission leaves whatever was
 // already loaded/default alone rather than saving an empty team code.
-void saveTeamParam() {
-  String entered = teamParam->getValue();
-  entered.trim();
-  entered.toUpperCase();
-  if (entered.length() == 0) return;
-  strncpy(teamCode, entered.c_str(), 3);
-  teamCode[3] = '\0';
-  prefs.putString("team", teamCode);
+// Team, time zone, and time format all save from this one callback -
+// WiFiManager only supports a single setSaveParamsCallback, fired once
+// when the portal's Save button is pressed (only happens if the portal
+// was actually shown - no saved WiFi, or a saved network failed to
+// connect). Each field is independently validated so a bad entry in one
+// doesn't block the others from saving; blank/invalid falls back to
+// whatever was already loaded rather than saving garbage.
+void saveConfigParams() {
+  String enteredTeam = teamParam->getValue();
+  enteredTeam.trim();
+  enteredTeam.toUpperCase();
+  if (enteredTeam.length() > 0) {
+    strncpy(teamCode, enteredTeam.c_str(), 3);
+    teamCode[3] = '\0';
+    prefs.putString("team", teamCode);
+  }
+
+  String enteredTz = tzParam->getValue();
+  enteredTz.trim();
+  enteredTz.toUpperCase();
+  if (enteredTz.length() > 0 && posixTzFor(enteredTz.c_str()) != nullptr) {
+    strncpy(tzAbbrev, enteredTz.c_str(), 3);
+    tzAbbrev[3] = '\0';
+    prefs.putString("tz", tzAbbrev);
+  }
+
+  String enteredFmt = timeFormatParam->getValue();
+  enteredFmt.trim();
+  strncpy(timeFormat, (enteredFmt == "24") ? "24" : "12", sizeof(timeFormat) - 1);
+  timeFormat[sizeof(timeFormat) - 1] = '\0';
+  prefs.putString("fmt", timeFormat);
 }
 
 // Fires the moment WiFiManager opens its own "ESP32-Dashboard-Setup" AP -
@@ -711,9 +794,9 @@ void configPortalStarted(WiFiManager* wmInstance) {
   tft.setCursor(10, 112);
   tft.println("   (or visit 192.168.4.1)");
   tft.setCursor(10, 128);
-  tft.println("3. Pick your WiFi + enter");
+  tft.println("3. Pick your WiFi, team,");
   tft.setCursor(10, 144);
-  tft.println("   your team (e.g. PHI)");
+  tft.println("   time zone + time format");
 }
 
 void setup() {
@@ -753,6 +836,19 @@ void setup() {
     teamCode[3] = '\0';
   }
 
+  String savedTz = prefs.getString("tz", tzAbbrev);
+  savedTz.trim();
+  savedTz.toUpperCase();
+  if (posixTzFor(savedTz.c_str()) != nullptr) {
+    strncpy(tzAbbrev, savedTz.c_str(), 3);
+    tzAbbrev[3] = '\0';
+  }
+
+  String savedFmt = prefs.getString("fmt", timeFormat);
+  savedFmt.trim();
+  strncpy(timeFormat, (savedFmt == "24") ? "24" : "12", sizeof(timeFormat) - 1);
+  timeFormat[sizeof(timeFormat) - 1] = '\0';
+
   tft.fillScreen(TFT_WHITE);
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
   tft.setTextSize(2);
@@ -760,10 +856,14 @@ void setup() {
   tft.println("Connecting WiFi...");
 
   teamParam = new WiFiManagerParameter("team", "Team Abbreviation (e.g. PHI)", teamCode, 4);
+  tzParam = new WiFiManagerParameter("tz", "Time Zone (ET, CT, MT, PT, or AT)", tzAbbrev, 4);
+  timeFormatParam = new WiFiManagerParameter("fmt", "Time Format (12 or 24)", timeFormat, 4);
 
   WiFiManager wm;
   wm.addParameter(teamParam);
-  wm.setSaveParamsCallback(saveTeamParam);
+  wm.addParameter(tzParam);
+  wm.addParameter(timeFormatParam);
+  wm.setSaveParamsCallback(saveConfigParams);
   wm.setAPCallback(configPortalStarted);
   // Give up and reboot (to try the whole thing again) rather than block
   // forever with the AP up and nobody around to connect to it.
@@ -785,9 +885,10 @@ void setup() {
   }
 
   // Built once here from whatever team ended up saved (either loaded
-  // above, or just written by saveTeamParam() if the portal was shown) -
-  // reconnectMQTT()/callback() below just reference these, never rebuild
-  // them, so a team change mid-runtime isn't possible without a reboot.
+  // above, or just written by saveConfigParams() if the portal was
+  // shown) - reconnectMQTT()/callback() below just reference these,
+  // never rebuild them, so a team change mid-runtime isn't possible
+  // without a reboot.
   snprintf(standingsTopic, sizeof(standingsTopic), "dashboard/%s/standings", teamCode);
   snprintf(rosterTopic, sizeof(rosterTopic), "dashboard/%s/roster", teamCode);
 
@@ -800,11 +901,16 @@ void setup() {
   client.setCallback(callback);
   client.setBufferSize(16384);  // see callback()'s comment - must fit the largest payload, with headroom
 
-  // Eastern time (auto DST-adjusted between EST/EDT) for the bottom-left
-  // clock box on every screen - see renderClock(). Independent of the
-  // Pi/MQTT side entirely, just needs this network's own internet access
-  // to reach an NTP server.
-  configTzTime("EST5EDT,M3.2.0,M11.1.0", "pool.ntp.org", "time.nist.gov");
+  // Whichever zone ended up saved (auto DST-adjusted, see the POSIX TZ
+  // strings in TZ_TABLE) for the bottom-left clock box on every screen -
+  // see renderClock(). Independent of the Pi/MQTT side entirely, just
+  // needs this network's own internet access to reach an NTP server.
+  // posixTzFor() can't actually return nullptr here - tzAbbrev only ever
+  // holds a value that already passed that same lookup, above or in
+  // saveConfigParams() - but the "ET" fallback keeps this from silently
+  // passing nullptr to configTzTime() if that invariant ever breaks.
+  const char* posixTz = posixTzFor(tzAbbrev);
+  configTzTime(posixTz ? posixTz : posixTzFor("ET"), "pool.ntp.org", "time.nist.gov");
 
   reconnectMQTT();
 
