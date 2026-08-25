@@ -230,8 +230,8 @@ const char* posixTzFor(const char* abbrev) {
 // TODO: fill in once the HiveMQ Cloud cluster exists.
 const char* mqtt_server = "52d35eeb56c24538a0883b18917b1ee8.s1.eu.hivemq.cloud";
 const uint16_t mqtt_port = 8883;
-const char* mqtt_username = "TODO-restricted-subscriber-username";
-const char* mqtt_password = "TODO-restricted-subscriber-password";
+const char* mqtt_username = "mreedjr14_sub";
+const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
 
 WiFiManagerParameter* teamParam;
 WiFiManagerParameter* tzParam;
