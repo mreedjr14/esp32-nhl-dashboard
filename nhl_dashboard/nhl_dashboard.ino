@@ -311,18 +311,28 @@
 // v1.1.2/USB-bootstrap pattern, still targeting the existing v1.2.0
 // release.
 //
-// Iteration 21 (manual flow finally gave a real answer): confirmed live
-// - the download itself is completely healthy now (HTTP 200,
+// Iteration 21 (manual flow finally gave a real answer... partially):
+// confirmed live - the download itself is completely healthy (HTTP 200,
 // Content-Length 1239488 matching the actual asset size exactly) but
 // Update.begin() returned false while errorString() said "No Error".
-// That specific combination is an ESP32-core quirk, not a code bug: the
-// "image bigger than the OTA partition slot" check inside begin() only
-// logs at a debug verbosity most sketches never enable, and never sets
-// an error code - so a too-big binary and a genuinely-fine begin() both
-// otherwise look identical. Not something this sketch can fix - the
-// resolution is picking a Partition Scheme with a bigger OTA app slot in
-// the Arduino IDE (Tools menu) and reflashing via USB once so the new
-// partition table actually lands on the chip.
+// Suspected an ESP32-core quirk where the "image bigger than the OTA
+// partition slot" check inside begin() logs at a debug verbosity most
+// sketches never enable and never sets an error code, making a too-big
+// binary and a genuinely-fine begin() look identical. Recommended
+// switching to a Partition Scheme with a bigger OTA app slot.
+//
+// Iteration 22 (iteration 21's theory didn't survive contact with
+// hardware): confirmed live - switched to "Minimal SPIFFS (1.9MB APP
+// with OTA/128KB SPIFFS)" (1.9MB per OTA slot, comfortably more than the
+// 1.24MB image) AND did a full "Erase All Flash Before Sketch Upload" to
+// rule out stale OTA-bookkeeping data left over from the old partition
+// layout (a real, separate risk when changing partition schemes without
+// erasing). Update.begin() failed identically anyway. Rather than guess
+// a fourth time, checkForOTAUpdate() now prints ESP.getFreeSketchSpace()
+// and the actual running/next-update esp_partition_t details (label,
+// address, size) straight from esp_ota_ops.h immediately before
+// begin() - ground truth instead of inference, since two theories in a
+// row that looked solid on paper turned out wrong.
 
 #include <FS.h>
 #include <SPI.h>
@@ -335,6 +345,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <esp_ota_ops.h>
 #include <string.h>
 #include <time.h>
 
@@ -1083,16 +1094,32 @@ void checkForOTAUpdate() {
     return;
   }
 
+  // Ground truth instead of more guessing - the last theory (OTA
+  // partition too small) looked solid on paper and was wrong even after
+  // confirming a 1.9MB scheme and a full flash erase, so print exactly
+  // what the chip itself sees before calling begin() again.
+  Serial.printf("[OTA] Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
+  const esp_partition_t* runningPartition = esp_ota_get_running_partition();
+  const esp_partition_t* nextPartition = esp_ota_get_next_update_partition(NULL);
+  Serial.printf("[OTA] Running partition: %s @ 0x%x, size %u\n",
+                runningPartition ? runningPartition->label : "(null)",
+                runningPartition ? runningPartition->address : 0,
+                runningPartition ? runningPartition->size : 0);
+  Serial.printf("[OTA] Next update partition: %s @ 0x%x, size %u\n",
+                nextPartition ? nextPartition->label : "(null)",
+                nextPartition ? nextPartition->address : 0,
+                nextPartition ? nextPartition->size : 0);
+
   if (!Update.begin(contentLength)) {
-    // errorString() reporting "No Error" here specifically (rather than
-    // an actual error) is a known ESP32-core quirk: the "binary is
-    // bigger than the OTA partition slot" check inside Update.begin()
-    // only logs at a debug verbosity most sketches don't enable, and
-    // doesn't set an error code at all - so this exact combination
-    // (begin() returned false, errorString() says nothing's wrong)
-    // means "too big for the partition," not "something broke."
-    // Confirmed live (iteration 21) - see Tools > Partition Scheme.
-    Serial.printf("[OTA] Update.begin() failed (%s) - probably too big for the current OTA partition size (image is %d bytes). Check Tools > Partition Scheme.\n",
+    // errorString() reporting "No Error" here (rather than an actual
+    // error) despite begin() returning false was suspected (iteration
+    // 21) to be a silent "image too big for the OTA partition" check -
+    // that held up on paper but turned out NOT to be it: confirmed live
+    // with a 1.9MB-OTA-slot partition scheme and a full flash erase,
+    // still failed identically. Left unexplained - the ground-truth
+    // partition print above this block is there to actually find out
+    // instead of guessing again.
+    Serial.printf("[OTA] Update.begin() failed (%s), image is %d bytes.\n",
                   Update.errorString(), contentLength);
     updateHttp.end();
     return;
