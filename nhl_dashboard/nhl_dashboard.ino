@@ -235,6 +235,17 @@
 // can't OTA its way out of not being able to follow the OTA download's
 // own redirect), but every device after that, and every future release,
 // should OTA normally from here on.
+//
+// Iteration 15 (fix a downgrade bug found testing iteration 14's fix):
+// after the redirect fix, the very next boot logged "Latest release tag:
+// v1.1.0" while running v1.1.1 and tried to update anyway - the version
+// check was a plain "does the tag differ" comparison, which treats an
+// OLDER published release as reason to update just as readily as a
+// newer one. isNewerVersion() replaces that with an actual
+// major.minor.patch comparison. Another mandatory USB bootstrap, same
+// reasoning as iteration 14 - a device with the old backwards check
+// can't be trusted to correctly evaluate whether the fixed version is
+// itself "newer".
 
 #include <FS.h>
 #include <SPI.h>
@@ -311,7 +322,7 @@ const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
 // release identically when cutting a new version, or every device will
 // think that release is newer forever (or, if left the same as an
 // already-installed version, never notice it at all).
-#define FIRMWARE_VERSION "v1.1.1"
+#define FIRMWARE_VERSION "v1.1.2"
 const char* OTA_REPO = "mreedjr14/esp32-nhl-dashboard";
 // Once a day - GitHub's unauthenticated API rate limit (60/hr) is no
 // concern at that cadence, and firmware doesn't change often enough to
@@ -856,6 +867,25 @@ void reconnectMQTT() {
 // scheduled check will just try again.
 // --------------------------------------------------------------------
 
+// True if `latest` (a GitHub release tag, "vMAJOR.MINOR.PATCH") is a
+// newer version than `current` (FIRMWARE_VERSION, same format) - a plain
+// string-inequality check (the original approach) treats ANY different
+// tag as "newer", including older ones. Confirmed live: a device running
+// v1.1.1 attempted to "update" itself to the still-published v1.1.0
+// because the tags simply didn't match, which is exactly backwards.
+bool isNewerVersion(const char* latest, const char* current) {
+  if (latest[0] == 'v') latest++;
+  if (current[0] == 'v') current++;
+  int latestParts[3] = {0, 0, 0};
+  int currentParts[3] = {0, 0, 0};
+  sscanf(latest, "%d.%d.%d", &latestParts[0], &latestParts[1], &latestParts[2]);
+  sscanf(current, "%d.%d.%d", &currentParts[0], &currentParts[1], &currentParts[2]);
+  for (int i = 0; i < 3; i++) {
+    if (latestParts[i] != currentParts[i]) return latestParts[i] > currentParts[i];
+  }
+  return false;  // identical version
+}
+
 void checkForOTAUpdate() {
   Serial.printf("[OTA] Checking for update (running %s)...\n", FIRMWARE_VERSION);
 
@@ -883,9 +913,9 @@ void checkForOTAUpdate() {
 
   const char* tagName = releaseDoc["tag_name"];
   Serial.printf("[OTA] Latest release tag: %s\n", tagName ? tagName : "(none)");
-  if (!tagName || strcmp(tagName, FIRMWARE_VERSION) == 0) {
+  if (!tagName || !isNewerVersion(tagName, FIRMWARE_VERSION)) {
     Serial.println("[OTA] Already up to date.");
-    return;  // already current, or the release has no tag somehow
+    return;  // no tag, or the published release isn't newer than what's already running
   }
 
   // Take the first asset ending in ".bin" rather than assuming a fixed
