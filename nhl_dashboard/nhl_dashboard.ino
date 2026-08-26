@@ -164,6 +164,34 @@
 // of silently breaking configTzTime(), and that 24h format actually
 // renders as "HH:MM" rather than still trimming a leading zero meant
 // only for 12h hours.
+//
+// Iteration 10 (OTA updates via GitHub Releases): ArduinoOTA (the usual
+// push-from-your-laptop approach) only works when you're on the same LAN
+// as the device, which friends' devices never are. checkForOTAUpdate()
+// instead pulls: it asks GitHub's "latest release" API for this repo's
+// newest tag, and if it doesn't match FIRMWARE_VERSION, downloads and
+// flashes whatever .bin is attached to that release via HTTPUpdate, then
+// reboots itself. Runs once at boot and once a day after that (see
+// OTA_CHECK_INTERVAL_MS) - no user action needed on the device end.
+//
+// This only checks/downloads - it doesn't build or publish anything.
+// Cutting a new release is still a manual step: bump FIRMWARE_VERSION
+// above, compile via Arduino IDE's Sketch -> Export Compiled Binary
+// (produces nhl_dashboard.ino.bin in the sketch folder), commit/push the
+// source change, then create a GitHub Release tagged with the *exact*
+// same string as FIRMWARE_VERSION (including the "v") and upload that
+// .bin as its asset. Forgetting to bump the version, or tagging it
+// differently than FIRMWARE_VERSION, means devices already on that
+// version never notice the release exists.
+//
+// New libraries beyond what iteration 8 needed: none - HTTPClient and
+// HTTPUpdate both ship with the ESP32 board package already.
+//
+// Still unverified here too: that GitHub's API response actually parses
+// (its JSON is much larger than this sketch's MQTT payloads - deploy and
+// watch Serial output on first boot), that a real update completes and
+// reboots cleanly rather than bricking mid-flash, and that a device
+// already on the latest tag correctly does nothing instead of looping.
 
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -173,6 +201,8 @@
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <string.h>
 #include <time.h>
 
@@ -220,18 +250,30 @@ const char* posixTzFor(const char* abbrev) {
 
 // HiveMQ Cloud cluster (replaces the old local-LAN broker at
 // 192.168.1.78, which friends' devices on their own networks can't
-// reach) - fill in from the cluster's overview page in the HiveMQ Cloud
-// console. mqtt_username/mqtt_password are the RESTRICTED, subscribe-only
+// reach). mqtt_username/mqtt_password are the RESTRICTED, subscribe-only
 // credential set (ACL: subscribe on "dashboard/#" only, no publish) - not
 // dashboard_publish.py's publisher credentials. Safe to commit here even
 // though this repo is public: worst case if these leak is someone else
 // also subscribes to the same public standings/roster data, they can't
 // publish or read anything else.
-// TODO: fill in once the HiveMQ Cloud cluster exists.
 const char* mqtt_server = "52d35eeb56c24538a0883b18917b1ee8.s1.eu.hivemq.cloud";
 const uint16_t mqtt_port = 8883;
 const char* mqtt_username = "mreedjr14_sub";
 const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
+
+// OTA (see checkForOTAUpdate() and this file's Iteration 10 note up top).
+// FIRMWARE_VERSION must exactly match a GitHub release's tag name for
+// this device to recognize it's already current - bump this and tag the
+// release identically when cutting a new version, or every device will
+// think that release is newer forever (or, if left the same as an
+// already-installed version, never notice it at all).
+#define FIRMWARE_VERSION "v1.0.0"
+const char* OTA_REPO = "mreedjr14/esp32-nhl-dashboard";
+// Once a day - GitHub's unauthenticated API rate limit (60/hr) is no
+// concern at that cadence, and firmware doesn't change often enough to
+// need faster than daily.
+const unsigned long OTA_CHECK_INTERVAL_MS = 24UL * 60 * 60 * 1000;
+unsigned long lastOtaCheck = 0;
 
 WiFiManagerParameter* teamParam;
 WiFiManagerParameter* tzParam;
@@ -733,6 +775,64 @@ void reconnectMQTT() {
 }
 
 // --------------------------------------------------------------------
+// OTA - pull-based rather than the usual ArduinoOTA, since that only
+// works from a machine on the same LAN as the device (see this file's
+// Iteration 10 note up top). Checks GitHub's "latest release" API, and
+// if its tag doesn't match FIRMWARE_VERSION, downloads and flashes
+// whatever .bin is attached to that release. Every failure mode (no
+// internet, no releases yet, rate-limited, a release with no .bin
+// attached) just returns quietly - this runs unattended on someone
+// else's desk, there's no one to show an error to, and the next
+// scheduled check will just try again.
+// --------------------------------------------------------------------
+
+void checkForOTAUpdate() {
+  WiFiClientSecure apiClient;
+  apiClient.setInsecure();  // see espClient's setInsecure() comment in setup() - same tradeoff
+
+  HTTPClient http;
+  String apiUrl = String("https://api.github.com/repos/") + OTA_REPO + "/releases/latest";
+  http.begin(apiClient, apiUrl);
+  http.addHeader("User-Agent", "esp32-nhl-dashboard");  // GitHub's API rejects requests with no User-Agent at all
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return;
+  }
+
+  JsonDocument releaseDoc;
+  DeserializationError err = deserializeJson(releaseDoc, http.getStream());
+  http.end();
+  if (err) return;
+
+  const char* tagName = releaseDoc["tag_name"];
+  if (!tagName || strcmp(tagName, FIRMWARE_VERSION) == 0) {
+    return;  // already current, or the release has no tag somehow
+  }
+
+  // Take the first asset ending in ".bin" rather than assuming a fixed
+  // filename - whatever gets uploaded when cutting the release.
+  const char* downloadUrl = nullptr;
+  for (JsonObject asset : releaseDoc["assets"].as<JsonArray>()) {
+    const char* name = asset["name"];
+    if (name && strstr(name, ".bin")) {
+      downloadUrl = asset["browser_download_url"];
+      break;
+    }
+  }
+  if (!downloadUrl) return;  // tagged, but nothing to flash yet
+
+  WiFiClientSecure updateClient;
+  updateClient.setInsecure();
+  httpUpdate.rebootOnUpdate(true);  // on success this call never returns - the device reboots itself into the new firmware
+  httpUpdate.update(updateClient, downloadUrl);
+  // Only reachable if the update download/flash itself failed (bad
+  // asset, dropped connection mid-download, etc.) - nothing to do beyond
+  // letting the caller continue on the current firmware; next check
+  // retries.
+}
+
+// --------------------------------------------------------------------
 // WiFiManager callbacks (see iteration 8 note up top).
 // --------------------------------------------------------------------
 
@@ -914,6 +1014,12 @@ void setup() {
 
   reconnectMQTT();
 
+  // Once at boot, so a device that's been off for a while grabs any
+  // pending release before ever rendering a screen on stale firmware.
+  // loop() below re-checks once a day after this.
+  checkForOTAUpdate();
+  lastOtaCheck = millis();
+
   screenChangedAt = millis();
   render();
 }
@@ -945,5 +1051,13 @@ void loop() {
   if (now - lastClockTick >= 1000) {
     lastClockTick = now;
     renderClock();
+  }
+
+  // Daily OTA re-check (see checkForOTAUpdate()'s own comment) - the
+  // initial one already happened in setup(). A successful update reboots
+  // the device on its own; this only returns on "nothing to do."
+  if (now - lastOtaCheck >= OTA_CHECK_INTERVAL_MS) {
+    lastOtaCheck = now;
+    checkForOTAUpdate();
   }
 }
