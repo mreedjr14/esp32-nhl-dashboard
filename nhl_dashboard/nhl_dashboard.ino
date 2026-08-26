@@ -299,7 +299,7 @@ const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
 // release identically when cutting a new version, or every device will
 // think that release is newer forever (or, if left the same as an
 // already-installed version, never notice it at all).
-#define FIRMWARE_VERSION "v1.1.0"
+#define FIRMWARE_VERSION "v1.0.0"
 const char* OTA_REPO = "mreedjr14/esp32-nhl-dashboard";
 // Once a day - GitHub's unauthenticated API rate limit (60/hr) is no
 // concern at that cadence, and firmware doesn't change often enough to
@@ -845,6 +845,8 @@ void reconnectMQTT() {
 // --------------------------------------------------------------------
 
 void checkForOTAUpdate() {
+  Serial.printf("[OTA] Checking for update (running %s)...\n", FIRMWARE_VERSION);
+
   WiFiClientSecure apiClient;
   apiClient.setInsecure();  // see espClient's setInsecure() comment in setup() - same tradeoff
 
@@ -854,6 +856,7 @@ void checkForOTAUpdate() {
   http.addHeader("User-Agent", "esp32-nhl-dashboard");  // GitHub's API rejects requests with no User-Agent at all
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("[OTA] GitHub API request failed, HTTP code %d\n", httpCode);
     http.end();
     return;
   }
@@ -861,10 +864,15 @@ void checkForOTAUpdate() {
   JsonDocument releaseDoc;
   DeserializationError err = deserializeJson(releaseDoc, http.getStream());
   http.end();
-  if (err) return;
+  if (err) {
+    Serial.printf("[OTA] Failed to parse release JSON: %s\n", err.c_str());
+    return;
+  }
 
   const char* tagName = releaseDoc["tag_name"];
+  Serial.printf("[OTA] Latest release tag: %s\n", tagName ? tagName : "(none)");
   if (!tagName || strcmp(tagName, FIRMWARE_VERSION) == 0) {
+    Serial.println("[OTA] Already up to date.");
     return;  // already current, or the release has no tag somehow
   }
 
@@ -878,8 +886,12 @@ void checkForOTAUpdate() {
       break;
     }
   }
-  if (!downloadUrl) return;  // tagged, but nothing to flash yet
+  if (!downloadUrl) {
+    Serial.println("[OTA] Newer release found but it has no .bin asset - skipping.");
+    return;
+  }
 
+  Serial.printf("[OTA] Downloading %s\n", downloadUrl);
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
   httpUpdate.rebootOnUpdate(true);  // on success this call never returns - the device reboots itself into the new firmware
@@ -888,6 +900,7 @@ void checkForOTAUpdate() {
   // asset, dropped connection mid-download, etc.) - nothing to do beyond
   // letting the caller continue on the current firmware; next check
   // retries.
+  Serial.printf("[OTA] Update failed (error %d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
 }
 
 // --------------------------------------------------------------------
