@@ -192,6 +192,18 @@
 // watch Serial output on first boot), that a real update completes and
 // reboots cleanly rather than bricking mid-flash, and that a device
 // already on the latest tag correctly does nothing instead of looping.
+//
+// Iteration 12 (division name on the standings screen): the title was a
+// static "NHL"/"Standings" - fine when every device only ever showed the
+// Metropolitan (Flyers') standings, not fine now that each device shows
+// whatever division its own team belongs to. dashboard_publish.py's
+// standings payload carries a new "division" field (e.g. "Central",
+// "Pacific") which replaces the static "NHL" headline; capped at size2
+// (was size3) since "Metropolitan," the longest of the four division
+// names, only fits this side of the screen at that size. Unverified:
+// whether "Metropolitan" at size2 actually clears the vertical divider
+// at x=160 rather than running into it - it's a tight fit on paper
+// (~144px of a ~152px-wide space).
 
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -316,12 +328,21 @@ void renderStandings() {
   // Left half: a big two-line title filling the space freed up by
   // trimming the table on the right to 3 columns (per explicit request -
   // this side-by-side layout only fits with the row down to team/gp/pts).
-  tft.setTextSize(3);
-  tft.setTextColor(TFT_BLACK, TFT_WHITE);
-  tft.setCursor(8, 70);
-  tft.println("NHL");
+  // Division name (not a static "NHL") is the headline now that this
+  // isn't Flyers/Metropolitan-only - every team's own division, from
+  // dashboard_publish.py's payload. Capped at size2 rather than the
+  // original size3: "Metropolitan" (the longest of the four division
+  // names) doesn't fit this ~150px-wide half of the screen at size3,
+  // and size2 comfortably fits all four. Falls back to "NHL" if the
+  // field's missing (no data received yet, or an older cached payload
+  // from before this field existed).
+  const char* division = standingsDoc["division"] | "NHL";
   tft.setTextSize(2);
-  tft.setCursor(8, 112);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setCursor(8, 76);
+  tft.println(division);
+  tft.setTextSize(1);
+  tft.setCursor(8, 104);
   tft.println("Standings");
 
   tft.drawFastVLine(160, 0, 240, FLYERS_ORANGE);
