@@ -310,6 +310,19 @@
 // (ships with the ESP32 core, no install needed) replaces it. Still
 // v1.1.2/USB-bootstrap pattern, still targeting the existing v1.2.0
 // release.
+//
+// Iteration 21 (manual flow finally gave a real answer): confirmed live
+// - the download itself is completely healthy now (HTTP 200,
+// Content-Length 1239488 matching the actual asset size exactly) but
+// Update.begin() returned false while errorString() said "No Error".
+// That specific combination is an ESP32-core quirk, not a code bug: the
+// "image bigger than the OTA partition slot" check inside begin() only
+// logs at a debug verbosity most sketches never enable, and never sets
+// an error code - so a too-big binary and a genuinely-fine begin() both
+// otherwise look identical. Not something this sketch can fix - the
+// resolution is picking a Partition Scheme with a bigger OTA app slot in
+// the Arduino IDE (Tools menu) and reflashing via USB once so the new
+// partition table actually lands on the chip.
 
 #include <FS.h>
 #include <SPI.h>
@@ -1071,7 +1084,16 @@ void checkForOTAUpdate() {
   }
 
   if (!Update.begin(contentLength)) {
-    Serial.printf("[OTA] Update.begin() failed: %s\n", Update.errorString());
+    // errorString() reporting "No Error" here specifically (rather than
+    // an actual error) is a known ESP32-core quirk: the "binary is
+    // bigger than the OTA partition slot" check inside Update.begin()
+    // only logs at a debug verbosity most sketches don't enable, and
+    // doesn't set an error code at all - so this exact combination
+    // (begin() returned false, errorString() says nothing's wrong)
+    // means "too big for the partition," not "something broke."
+    // Confirmed live (iteration 21) - see Tools > Partition Scheme.
+    Serial.printf("[OTA] Update.begin() failed (%s) - probably too big for the current OTA partition size (image is %d bytes). Check Tools > Partition Scheme.\n",
+                  Update.errorString(), contentLength);
     updateHttp.end();
     return;
   }
