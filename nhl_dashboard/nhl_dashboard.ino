@@ -283,6 +283,18 @@
 // regardless of what the server sent. Fixed by registering "Location"
 // before the request. Same USB-bootstrap-then-retest-against-v1.2.0
 // pattern as iteration 17 - version stays at v1.1.2 here too.
+//
+// Iteration 19 (redirect resolution finally worked - new failure past
+// it): confirmed live - "Redirect request returned HTTP 302" and a
+// correctly-resolved 921-char URL, matching what curl found independently.
+// The follow-up download connection then failed with
+// "HTTP error: connection refused" (error -1) - two WiFiClientSecure/
+// HTTPClient TLS sessions open at once (one for redirect resolution, one
+// for the real download) was one too many for the ESP32's available TLS
+// session memory. Fixed by scoping redirectClient/redirectHttp inside a
+// block so they're fully destructed - freeing that memory - before
+// updateClient opens the second connection. Still v1.1.2/USB-bootstrap
+// pattern.
 
 #include <FS.h>
 #include <SPI.h>
@@ -984,32 +996,44 @@ void checkForOTAUpdate() {
   // then hand HTTPUpdate the already-resolved final URL - so the real
   // download is a single clean connection to the CDN host from scratch,
   // never touching HTTPUpdate's redirect-following logic at all.
-  WiFiClientSecure redirectClient;
-  redirectClient.setInsecure();
-  HTTPClient redirectHttp;
-  redirectHttp.begin(redirectClient, downloadUrl);
-  redirectHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-  redirectHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
-  // HTTPClient discards every response header by default - header()
-  // returns empty for anything not explicitly pre-registered here, no
-  // matter what the server actually sent. Confirmed live: without this,
-  // "Location" always came back empty even on a real 302 response.
-  const char* headersToCollect[] = {"Location"};
-  redirectHttp.collectHeaders(headersToCollect, 1);
-  int redirectCode = redirectHttp.GET();
-  Serial.printf("[OTA] Redirect request returned HTTP %d\n", redirectCode);
+  // Scoped in its own block, deliberately - redirectClient/redirectHttp
+  // (and their mbedTLS session memory, which is heavy on an ESP32) need
+  // to be fully destructed before updateClient opens a second TLS
+  // connection below. Confirmed live: without this scoping, the redirect
+  // resolved fine (HTTP 302, correct Location) but the follow-up
+  // download connection came back "HTTP error: connection refused"
+  // (error -1) - two concurrent TLS sessions was one too many.
   String finalUrl = downloadUrl;
-  if (redirectCode == 301 || redirectCode == 302 || redirectCode == 303 ||
-      redirectCode == 307 || redirectCode == 308) {
-    finalUrl = redirectHttp.header("Location");
+  int redirectCode = 0;
+  {
+    WiFiClientSecure redirectClient;
+    redirectClient.setInsecure();
+    HTTPClient redirectHttp;
+    redirectHttp.begin(redirectClient, downloadUrl);
+    redirectHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    redirectHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
+    // HTTPClient discards every response header by default - header()
+    // returns empty for anything not explicitly pre-registered here, no
+    // matter what the server actually sent. Confirmed live: without
+    // this, "Location" always came back empty even on a real 302
+    // response.
+    const char* headersToCollect[] = {"Location"};
+    redirectHttp.collectHeaders(headersToCollect, 1);
+    redirectCode = redirectHttp.GET();
+    Serial.printf("[OTA] Redirect request returned HTTP %d\n", redirectCode);
+    if (redirectCode == 301 || redirectCode == 302 || redirectCode == 303 ||
+        redirectCode == 307 || redirectCode == 308) {
+      finalUrl = redirectHttp.header("Location");
+    }
+    redirectHttp.end();
   }
-  redirectHttp.end();
 
   if (finalUrl.length() == 0) {
     Serial.println("[OTA] Redirect resolution failed - no Location header.");
     return;
   }
-  Serial.printf("[OTA] Resolved redirect (%d), downloading %d-char URL\n", redirectCode, finalUrl.length());
+  Serial.printf("[OTA] Resolved redirect (%d), downloading %d-char URL, free heap %u\n",
+                redirectCode, finalUrl.length(), ESP.getFreeHeap());
 
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
