@@ -333,6 +333,17 @@
 // address, size) straight from esp_ota_ops.h immediately before
 // begin() - ground truth instead of inference, since two theories in a
 // row that looked solid on paper turned out wrong.
+//
+// Iteration 23 (ground truth confirmed size was never the issue):
+// confirmed live - Free sketch space 1966080, running partition app0 @
+// 0x10000 size 1966080, next update partition app1 @ 0x1f0000 size
+// 1966080, all comfortably larger than the 1239488-byte image. Yet
+// Update.begin(contentLength) still failed with errorString() "No
+// Error." Since the partition itself is provably fine, testing whether
+// something in begin()'s exact-size comparison/handling is itself the
+// problem by passing UPDATE_SIZE_UNKNOWN instead - the writeStream()
+// byte-count check further down already independently confirms the full
+// image lands, so begin() doesn't strictly need the exact size upfront.
 
 #include <FS.h>
 #include <SPI.h>
@@ -1110,7 +1121,15 @@ void checkForOTAUpdate() {
                 nextPartition ? nextPartition->address : 0,
                 nextPartition ? nextPartition->size : 0);
 
-  if (!Update.begin(contentLength)) {
+  // UPDATE_SIZE_UNKNOWN instead of passing contentLength directly -
+  // ground truth (iteration 22) ruled out partition size/availability
+  // entirely (app1 is valid, 1966080 bytes, ~700KB more than this
+  // 1239488-byte image), yet begin(contentLength) still failed with no
+  // error recorded. Testing whether something in the exact-size
+  // comparison path itself is the problem, since we don't strictly need
+  // it - the writeStream() byte-count check below already independently
+  // verifies the full image was written.
+  if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
     // errorString() reporting "No Error" here (rather than an actual
     // error) despite begin() returning false was suspected (iteration
     // 21) to be a silent "image too big for the OTA partition" check -
