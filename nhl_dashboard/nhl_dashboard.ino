@@ -274,6 +274,15 @@
 // pattern) so this fix can bootstrap via USB and then be tested against
 // the *existing* v1.2.0 release live, rather than needing yet another
 // release cut.
+//
+// Iteration 18 (iteration 17's fix had its own bug): manual redirect
+// resolution ran but immediately hit "no Location header" even though
+// the server does send one - HTTPClient::header() only ever returns
+// values for headers pre-registered via collectHeaders(), which iteration
+// 17 never called. Every response header was being silently discarded
+// regardless of what the server sent. Fixed by registering "Location"
+// before the request. Same USB-bootstrap-then-retest-against-v1.2.0
+// pattern as iteration 17 - version stays at v1.1.2 here too.
 
 #include <FS.h>
 #include <SPI.h>
@@ -981,7 +990,14 @@ void checkForOTAUpdate() {
   redirectHttp.begin(redirectClient, downloadUrl);
   redirectHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   redirectHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
+  // HTTPClient discards every response header by default - header()
+  // returns empty for anything not explicitly pre-registered here, no
+  // matter what the server actually sent. Confirmed live: without this,
+  // "Location" always came back empty even on a real 302 response.
+  const char* headersToCollect[] = {"Location"};
+  redirectHttp.collectHeaders(headersToCollect, 1);
   int redirectCode = redirectHttp.GET();
+  Serial.printf("[OTA] Redirect request returned HTTP %d\n", redirectCode);
   String finalUrl = downloadUrl;
   if (redirectCode == 301 || redirectCode == 302 || redirectCode == 303 ||
       redirectCode == 307 || redirectCode == 308) {
