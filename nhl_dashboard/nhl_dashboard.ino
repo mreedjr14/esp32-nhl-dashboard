@@ -205,6 +205,15 @@
 // at x=160 rather than running into it - it's a tight fit on paper
 // (~144px of a ~152px-wide space).
 
+// Must be the very first include. WiFiManager -> WebServer.h expects the
+// bare name "FS" to already mean fs::FS by the time it's compiled, but
+// TFT_eSPI.h (below) pulls in FS.h itself first in a way that doesn't
+// leave that alias active - the result is a "'FS' was not declared in
+// this scope; did you mean 'fs::FS'" build error out of WebServer.h.
+// Including it here first locks in FS.h's own `using fs::FS;` before
+// anything else touches it (a known WiFiManager/ESP32-core-3.x
+// interaction, not specific to this sketch).
+#include <FS.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
