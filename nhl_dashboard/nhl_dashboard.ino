@@ -392,6 +392,20 @@
 // after WiFi connects, before any MQTT setup at all. Topic-building,
 // espClient/client setup, configTzTime, and reconnectMQTT() now all run
 // after the OTA check instead of before it.
+//
+// Iteration 27 (so close - the full image made it, end() still balked):
+// confirmed live - iteration 26's reordering worked as intended (free
+// heap 163020 at the start of the check, vs ~93000 before), Update.begin()
+// succeeded, and writeStream() delivered the complete image (1239488 of
+// 1239488 bytes, exact match) over a ~48s transfer. Update.end() still
+// refused, with a real, specific error this time: "Stream Read Timeout".
+// Given every byte demonstrably arrived, this reads as a transient stall
+// during the transfer (each writeStream() chunk pauses to erase/write
+// flash before its next socket read, which can make that next read look
+// "slow" against a tight default timeout) rather than an actual dropped
+// connection - extended both updateClient's and updateHttp's read
+// timeouts to 15s to stop that stall from being flagged as a timeout at
+// all.
 
 #include <FS.h>
 #include <SPI.h>
@@ -1173,9 +1187,20 @@ void checkForOTAUpdate() {
   // visibly or prints a real reason.
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
+  // Default read timeout is too tight for a ~1.2MB transfer interleaved
+  // with actual flash writes (each writeStream() chunk pauses to erase/
+  // write flash before the next socket read, which can make that next
+  // read look "slow" relative to a short timeout even though the
+  // connection itself is fine). Confirmed live (iteration 27): every
+  // byte (1239488 of 1239488) made it through writeStream() successfully,
+  // but Update.end() still refused with "Stream Read Timeout" - a
+  // transient stall during the transfer, not an actual dropped
+  // connection or missing data.
+  updateClient.setTimeout(15000);
   HTTPClient updateHttp;
   updateHttp.begin(updateClient, finalUrl);
   updateHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
+  updateHttp.setTimeout(15000);
   int updateCode = updateHttp.GET();
   int contentLength = updateHttp.getSize();
   Serial.printf("[OTA] Download request returned HTTP %d, Content-Length %d\n", updateCode, contentLength);
