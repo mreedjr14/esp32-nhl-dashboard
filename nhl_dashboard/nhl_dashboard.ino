@@ -344,6 +344,26 @@
 // problem by passing UPDATE_SIZE_UNKNOWN instead - the writeStream()
 // byte-count check further down already independently confirms the full
 // image lands, so begin() doesn't strictly need the exact size upfront.
+//
+// Iteration 24 (the real answer, from Core Debug Level Verbose): both
+// UPDATE_SIZE_UNKNOWN and the exact size failed identically, so raised
+// Tools > Core Debug Level from None to Verbose (no code change) to let
+// the ESP32 core's own internal log_e()/log_w() calls - which had been
+// silenced this whole time - actually reach Serial. Immediately found
+// it: "[E][Updater.cpp:293] begin(): _buffer allocation failed". Not a
+// partition problem at all (already proven fine) - heap fragmentation.
+// This board has no PSRAM, and everything shares one small internal SRAM
+// pool; the post-setup memory dump (also a Verbose-level feature) showed
+// 145KB technically free but only ~40KB in the single largest
+// contiguous block, with the download's own TLS session still holding
+// its buffers open at the exact moment Update.begin() needs its own
+// chunk (can't close that connection first - writeStream() still needs
+// to read from it). Fixed by shrinking updateClient's mbedTLS buffers
+// via setBufferSizes() - see its call site. Four wrong-or-incomplete
+// theories (iterations 14/17/19 partially, 21, 23) before Verbose
+// logging just showed the real error directly - worth remembering next
+// time an ESP32 failure looks inexplicable: turn that on early, not
+// late.
 
 #include <FS.h>
 #include <SPI.h>
@@ -1092,6 +1112,19 @@ void checkForOTAUpdate() {
   // visibly or prints a real reason.
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
+  // Shrinks mbedTLS's own internal I/O buffers for this connection -
+  // this board has no PSRAM, so everything (WiFi stack, this TLS
+  // session, TFT_eSPI, WiFiManager, MQTT's 16KB buffer) shares one small
+  // internal SRAM pool. Confirmed live (iteration 24): Update.begin()
+  // was failing with "_buffer allocation failed" - not a partition
+  // problem (already ruled out with ground-truth partition data), but
+  // heap fragmentation - 145KB technically free but only ~40KB in the
+  // single largest contiguous block, with this connection's own TLS
+  // buffers still held open (needed for writeStream() below) at the
+  // exact moment Update.begin() needs its own chunk. Recv stays large
+  // enough for reasonable download throughput; xmit only ever needs to
+  // fit a short GET request.
+  updateClient.setBufferSizes(2048, 512);
   HTTPClient updateHttp;
   updateHttp.begin(updateClient, finalUrl);
   updateHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
