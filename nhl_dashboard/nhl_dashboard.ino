@@ -358,12 +358,24 @@
 // contiguous block, with the download's own TLS session still holding
 // its buffers open at the exact moment Update.begin() needs its own
 // chunk (can't close that connection first - writeStream() still needs
-// to read from it). Fixed by shrinking updateClient's mbedTLS buffers
-// via setBufferSizes() - see its call site. Four wrong-or-incomplete
-// theories (iterations 14/17/19 partially, 21, 23) before Verbose
-// logging just showed the real error directly - worth remembering next
-// time an ESP32 failure looks inexplicable: turn that on early, not
-// late.
+// to read from it). Attempted fix: shrinking updateClient's mbedTLS
+// buffers via setBufferSizes() - which doesn't compile, see iteration
+// 25. Four wrong-or-incomplete theories (iterations 14/17/19 partially,
+// 21, 23) before Verbose logging just showed the real error directly -
+// worth remembering next time an ESP32 failure looks inexplicable: turn
+// that on early, not late.
+//
+// Iteration 25 (setBufferSizes() doesn't exist in this core version -
+// structural fix instead): confirmed via the actual NetworkClientSecure.h
+// header for this exact core release (3.3.11) that no such method is
+// exposed at all - WiFiClientSecure's mbedTLS buffer sizes aren't
+// application-configurable here. Reordered instead: Update.begin() now
+// runs BEFORE updateClient/the download's TLS connection are even
+// created, so its buffer allocation happens while heap is at its least
+// fragmented, rather than competing with an already-open TLS session for
+// the same small pool. Content-Length is no longer known until after
+// begin() succeeds, so begin() uses UPDATE_SIZE_UNKNOWN (already known
+// safe from iteration 23) rather than an exact size.
 
 #include <FS.h>
 #include <SPI.h>
@@ -1105,43 +1117,10 @@ void checkForOTAUpdate() {
   Serial.printf("[OTA] Resolved redirect (%d), downloading %d-char URL, free heap %u\n",
                 redirectCode, finalUrl.length(), ESP.getFreeHeap());
 
-  // Manual HTTPClient + Update flow, not httpUpdate.update() - that
-  // wrapper gave nothing but "error 0, empty string" through three
-  // different real bugs in a row (iterations 14/17/19), which stopped
-  // being useful information. This way every step below either succeeds
-  // visibly or prints a real reason.
-  WiFiClientSecure updateClient;
-  updateClient.setInsecure();
-  // Shrinks mbedTLS's own internal I/O buffers for this connection -
-  // this board has no PSRAM, so everything (WiFi stack, this TLS
-  // session, TFT_eSPI, WiFiManager, MQTT's 16KB buffer) shares one small
-  // internal SRAM pool. Confirmed live (iteration 24): Update.begin()
-  // was failing with "_buffer allocation failed" - not a partition
-  // problem (already ruled out with ground-truth partition data), but
-  // heap fragmentation - 145KB technically free but only ~40KB in the
-  // single largest contiguous block, with this connection's own TLS
-  // buffers still held open (needed for writeStream() below) at the
-  // exact moment Update.begin() needs its own chunk. Recv stays large
-  // enough for reasonable download throughput; xmit only ever needs to
-  // fit a short GET request.
-  updateClient.setBufferSizes(2048, 512);
-  HTTPClient updateHttp;
-  updateHttp.begin(updateClient, finalUrl);
-  updateHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
-  int updateCode = updateHttp.GET();
-  int contentLength = updateHttp.getSize();
-  Serial.printf("[OTA] Download request returned HTTP %d, Content-Length %d\n", updateCode, contentLength);
-
-  if (updateCode != HTTP_CODE_OK || contentLength <= 0) {
-    Serial.println("[OTA] Download request didn't return 200 with a valid size - aborting.");
-    updateHttp.end();
-    return;
-  }
-
   // Ground truth instead of more guessing - the last theory (OTA
   // partition too small) looked solid on paper and was wrong even after
   // confirming a 1.9MB scheme and a full flash erase, so print exactly
-  // what the chip itself sees before calling begin() again.
+  // what the chip itself sees before calling begin().
   Serial.printf("[OTA] Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
   const esp_partition_t* runningPartition = esp_ota_get_running_partition();
   const esp_partition_t* nextPartition = esp_ota_get_next_update_partition(NULL);
@@ -1154,25 +1133,44 @@ void checkForOTAUpdate() {
                 nextPartition ? nextPartition->address : 0,
                 nextPartition ? nextPartition->size : 0);
 
-  // UPDATE_SIZE_UNKNOWN instead of passing contentLength directly -
-  // ground truth (iteration 22) ruled out partition size/availability
-  // entirely (app1 is valid, 1966080 bytes, ~700KB more than this
-  // 1239488-byte image), yet begin(contentLength) still failed with no
-  // error recorded. Testing whether something in the exact-size
-  // comparison path itself is the problem, since we don't strictly need
-  // it - the writeStream() byte-count check below already independently
-  // verifies the full image was written.
+  // Called here - BEFORE the download's TLS connection is even opened -
+  // deliberately (iteration 25). Verbose core logging (iteration 24)
+  // showed Update.begin() failing with "_buffer allocation failed": this
+  // board has no PSRAM, so WiFi/TLS/TFT_eSPI/WiFiManager/MQTT's 16KB
+  // buffer all share one small internal SRAM pool, and by the time a
+  // download's own TLS session was already open (needed to stream the
+  // image), there wasn't one large enough contiguous block left for
+  // Update's own buffer. WiFiClientSecure has no public API in this
+  // ESP32 core version to shrink its mbedTLS buffers (confirmed - no
+  // setBufferSizes() member exists), so instead: get Update's allocation
+  // done FIRST, while heap is at its least fragmented, then open the
+  // download connection only after that succeeds.
   if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-    // errorString() reporting "No Error" here (rather than an actual
-    // error) despite begin() returning false was suspected (iteration
-    // 21) to be a silent "image too big for the OTA partition" check -
-    // that held up on paper but turned out NOT to be it: confirmed live
-    // with a 1.9MB-OTA-slot partition scheme and a full flash erase,
-    // still failed identically. Left unexplained - the ground-truth
-    // partition print above this block is there to actually find out
-    // instead of guessing again.
-    Serial.printf("[OTA] Update.begin() failed (%s), image is %d bytes.\n",
-                  Update.errorString(), contentLength);
+    Serial.printf("[OTA] Update.begin() failed (%s).\n", Update.errorString());
+    return;
+  }
+
+  // Manual HTTPClient + Update flow, not httpUpdate.update() - that
+  // wrapper gave nothing but "error 0, empty string" through three
+  // different real bugs in a row (iterations 14/17/19), which stopped
+  // being useful information. This way every step below either succeeds
+  // visibly or prints a real reason.
+  WiFiClientSecure updateClient;
+  updateClient.setInsecure();
+  HTTPClient updateHttp;
+  updateHttp.begin(updateClient, finalUrl);
+  updateHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
+  int updateCode = updateHttp.GET();
+  int contentLength = updateHttp.getSize();
+  Serial.printf("[OTA] Download request returned HTTP %d, Content-Length %d\n", updateCode, contentLength);
+
+  if (updateCode != HTTP_CODE_OK || contentLength <= 0) {
+    // Update.begin() already succeeded above with no matching end() -
+    // left as-is rather than adding abort-handling for what should be a
+    // rare case (the download itself has proven reliable in every prior
+    // round) - Update's state is per-boot, so the next check (this loop
+    // or the next boot) starts clean regardless.
+    Serial.println("[OTA] Download request didn't return 200 with a valid size - aborting.");
     updateHttp.end();
     return;
   }
