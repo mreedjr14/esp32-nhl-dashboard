@@ -246,6 +246,19 @@
 // reasoning as iteration 14 - a device with the old backwards check
 // can't be trusted to correctly evaluate whether the fixed version is
 // itself "newer".
+//
+// Iteration 16 (boot-status screen, and the first real no-USB OTA test):
+// per explicit request, setup() now shows its progress on the TFT
+// instead of just "Connecting WiFi..." the whole time - a
+// "Connecting to github..." line while checkForOTAUpdate() runs, then
+// "Release vX.Y.Z" (whatever's actually left running after that call
+// returns - if an update was applied, the device already rebooted, so
+// this always reflects the version that's really live) and a fixed
+// "CROSBY SUCKS!!!" line, held for 2 seconds before the slideshow
+// starts. This version bump (v1.1.2 -> v1.2.0) is deliberately NOT being
+// flashed via USB - both iteration 14 and 15's fixes are already on the
+// device, so this is the first release meant to prove the whole OTA path
+// actually works unattended, end to end.
 
 #include <FS.h>
 #include <SPI.h>
@@ -322,7 +335,7 @@ const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
 // release identically when cutting a new version, or every device will
 // think that release is newer forever (or, if left the same as an
 // already-installed version, never notice it at all).
-#define FIRMWARE_VERSION "v1.1.2"
+#define FIRMWARE_VERSION "v1.2.0"
 const char* OTA_REPO = "mreedjr14/esp32-nhl-dashboard";
 // Once a day - GitHub's unauthenticated API rate limit (60/hr) is no
 // concern at that cadence, and firmware doesn't change often enough to
@@ -1134,11 +1147,34 @@ void setup() {
 
   reconnectMQTT();
 
+  // Boot-status sequence (iteration 16, per explicit request) - redrawn
+  // fresh here rather than reusing whatever's already on screen, so it
+  // reads the same whether or not the captive portal was shown earlier
+  // (which would otherwise have left its own instructions on screen
+  // instead of "Connecting WiFi...").
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 20);
+  tft.println("Connecting WiFi...");
+  tft.setCursor(10, 46);
+  tft.println("Connecting to github...");
+
   // Once at boot, so a device that's been off for a while grabs any
   // pending release before ever rendering a screen on stale firmware.
-  // loop() below re-checks once a day after this.
+  // loop() below re-checks once a day after this. Reboots on its own if
+  // an update is actually applied - the "Release"/"CROSBY SUCKS!!!"
+  // lines below only ever show whatever version is left running after
+  // this call returns, which is exactly the point of showing them.
   checkForOTAUpdate();
   lastOtaCheck = millis();
+
+  tft.setCursor(10, 72);
+  tft.print("Release ");
+  tft.println(FIRMWARE_VERSION);
+  tft.setCursor(10, 98);
+  tft.println("CROSBY SUCKS!!!");
+  delay(2000);
 
   screenChangedAt = millis();
   render();
