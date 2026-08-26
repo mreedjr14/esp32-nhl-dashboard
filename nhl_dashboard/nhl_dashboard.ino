@@ -295,6 +295,21 @@
 // block so they're fully destructed - freeing that memory - before
 // updateClient opens the second connection. Still v1.1.2/USB-bootstrap
 // pattern.
+//
+// Iteration 20 (give up on HTTPUpdate's black box, do the download
+// manually): confirmed live - redirect resolution now works cleanly
+// (HTTP 302, correctly resolved, free heap a healthy 93368 bytes ruling
+// out iteration 19's memory theory as the cause of THIS failure) but
+// httpUpdate.update() on the resolved URL still failed with the exact
+// same uninformative "error 0, empty string" as iterations 14 and 17 -
+// three different real bugs in a row hiding behind the identical
+// unhelpful symptom. Replaced entirely with a manual HTTPClient GET +
+// Update.begin()/writeStream()/end() sequence, each step logging its own
+// real HTTP code / byte count / Update.errorString() - no more guessing
+// what "error 0" means. httpUpdate/HTTPUpdate.h are gone; Update.h
+// (ships with the ESP32 core, no install needed) replaces it. Still
+// v1.1.2/USB-bootstrap pattern, still targeting the existing v1.2.0
+// release.
 
 #include <FS.h>
 #include <SPI.h>
@@ -306,7 +321,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
-#include <HTTPUpdate.h>
+#include <Update.h>
 #include <string.h>
 #include <time.h>
 
@@ -1035,15 +1050,50 @@ void checkForOTAUpdate() {
   Serial.printf("[OTA] Resolved redirect (%d), downloading %d-char URL, free heap %u\n",
                 redirectCode, finalUrl.length(), ESP.getFreeHeap());
 
+  // Manual HTTPClient + Update flow, not httpUpdate.update() - that
+  // wrapper gave nothing but "error 0, empty string" through three
+  // different real bugs in a row (iterations 14/17/19), which stopped
+  // being useful information. This way every step below either succeeds
+  // visibly or prints a real reason.
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
-  httpUpdate.rebootOnUpdate(true);  // on success this call never returns - the device reboots itself into the new firmware
-  httpUpdate.update(updateClient, finalUrl);
-  // Only reachable if the update download/flash itself failed (bad
-  // asset, dropped connection mid-download, etc.) - nothing to do beyond
-  // letting the caller continue on the current firmware; next check
-  // retries.
-  Serial.printf("[OTA] Update failed (error %d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+  HTTPClient updateHttp;
+  updateHttp.begin(updateClient, finalUrl);
+  updateHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
+  int updateCode = updateHttp.GET();
+  int contentLength = updateHttp.getSize();
+  Serial.printf("[OTA] Download request returned HTTP %d, Content-Length %d\n", updateCode, contentLength);
+
+  if (updateCode != HTTP_CODE_OK || contentLength <= 0) {
+    Serial.println("[OTA] Download request didn't return 200 with a valid size - aborting.");
+    updateHttp.end();
+    return;
+  }
+
+  if (!Update.begin(contentLength)) {
+    Serial.printf("[OTA] Update.begin() failed: %s\n", Update.errorString());
+    updateHttp.end();
+    return;
+  }
+
+  size_t written = Update.writeStream(*updateHttp.getStreamPtr());
+  Serial.printf("[OTA] Wrote %u of %d bytes\n", written, contentLength);
+
+  if (written != (size_t)contentLength) {
+    Serial.println("[OTA] writeStream() didn't deliver the full image - aborting.");
+    updateHttp.end();
+    return;
+  }
+
+  if (!Update.end() || !Update.isFinished()) {
+    Serial.printf("[OTA] Update.end() failed: %s\n", Update.errorString());
+    updateHttp.end();
+    return;
+  }
+
+  updateHttp.end();
+  Serial.println("[OTA] Update applied successfully - rebooting.");
+  ESP.restart();
 }
 
 // --------------------------------------------------------------------
