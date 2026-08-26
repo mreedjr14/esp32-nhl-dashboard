@@ -376,6 +376,22 @@
 // the same small pool. Content-Length is no longer known until after
 // begin() succeeds, so begin() uses UPDATE_SIZE_UNKNOWN (already known
 // safe from iteration 23) rather than an exact size.
+//
+// Iteration 26 (moved the whole OTA check earlier in setup(), before
+// MQTT): confirmed live - iteration 25's reordering got Update.begin()
+// past its allocation failure, but shifted the same fragmentation
+// problem one step later: the download's own TLS connection then failed
+// ("HTTP -1: HTTP error: connection refused"). This board just barely
+// has room for one big allocation at a time, not both a live TLS session
+// and Update's buffer together. client.setBufferSize(16384) (a
+// permanent 16KB allocation, held for the sketch's entire life) was
+// already carved out before checkForOTAUpdate() ran, for a feature
+// (MQTT) not even needed during the update attempt itself. Moved the
+// entire OTA check - and its boot-status screen lines, since neither
+// depends on MQTT or the team-based topic strings - to run immediately
+// after WiFi connects, before any MQTT setup at all. Topic-building,
+// espClient/client setup, configTzTime, and reconnectMQTT() now all run
+// after the OTA check instead of before it.
 
 #include <FS.h>
 #include <SPI.h>
@@ -1347,6 +1363,41 @@ void setup() {
     ESP.restart();
   }
 
+  // Boot-status sequence (iteration 16, per explicit request) - redrawn
+  // fresh here rather than reusing whatever's already on screen, so it
+  // reads the same whether or not the captive portal was shown earlier
+  // (which would otherwise have left its own instructions on screen
+  // instead of "Connecting WiFi...").
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 20);
+  tft.println("Connecting WiFi...");
+  tft.setCursor(10, 46);
+  tft.println("Connecting to github...");
+
+  // Runs here - BEFORE any MQTT setup - deliberately (iteration 26).
+  // client.setBufferSize(16384) below is a permanent allocation held for
+  // the rest of the sketch's life; on a no-PSRAM board already fighting
+  // heap fragmentation to get checkForOTAUpdate() working at all
+  // (iterations 24/25), there's no reason to have that 16KB already
+  // carved out during the one moment memory is tightest. Once at boot,
+  // so a device that's been off for a while grabs any pending release
+  // before ever rendering a screen on stale firmware. loop() below
+  // re-checks once a day after this. Reboots on its own if an update is
+  // actually applied - the "Release"/"CROSBY SUCKS!!!" lines below only
+  // ever show whatever version is left running after this call returns,
+  // which is exactly the point of showing them.
+  checkForOTAUpdate();
+  lastOtaCheck = millis();
+
+  tft.setCursor(10, 72);
+  tft.print("Release ");
+  tft.println(FIRMWARE_VERSION);
+  tft.setCursor(10, 98);
+  tft.println("CROSBY SUCKS!!!");
+  delay(2000);
+
   // Built once here from whatever team ended up saved (either loaded
   // above, or just written by saveConfigParams() if the portal was
   // shown) - reconnectMQTT()/callback() below just reference these,
@@ -1376,35 +1427,6 @@ void setup() {
   configTzTime(posixTz ? posixTz : posixTzFor("ET"), "pool.ntp.org", "time.nist.gov");
 
   reconnectMQTT();
-
-  // Boot-status sequence (iteration 16, per explicit request) - redrawn
-  // fresh here rather than reusing whatever's already on screen, so it
-  // reads the same whether or not the captive portal was shown earlier
-  // (which would otherwise have left its own instructions on screen
-  // instead of "Connecting WiFi...").
-  tft.fillScreen(TFT_WHITE);
-  tft.setTextColor(TFT_BLACK, TFT_WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(10, 20);
-  tft.println("Connecting WiFi...");
-  tft.setCursor(10, 46);
-  tft.println("Connecting to github...");
-
-  // Once at boot, so a device that's been off for a while grabs any
-  // pending release before ever rendering a screen on stale firmware.
-  // loop() below re-checks once a day after this. Reboots on its own if
-  // an update is actually applied - the "Release"/"CROSBY SUCKS!!!"
-  // lines below only ever show whatever version is left running after
-  // this call returns, which is exactly the point of showing them.
-  checkForOTAUpdate();
-  lastOtaCheck = millis();
-
-  tft.setCursor(10, 72);
-  tft.print("Release ");
-  tft.println(FIRMWARE_VERSION);
-  tft.setCursor(10, 98);
-  tft.println("CROSBY SUCKS!!!");
-  delay(2000);
 
   screenChangedAt = millis();
   render();
