@@ -213,6 +213,17 @@
 // Including it here first locks in FS.h's own `using fs::FS;` before
 // anything else touches it (a known WiFiManager/ESP32-core-3.x
 // interaction, not specific to this sketch).
+//
+// Iteration 13 (bigger standings table, seen live on real hardware):
+// confirmed live that the division title/clock box changes render as
+// intended, but the Team/GP/Pts table itself was still size1 and read
+// noticeably smaller than everything else on the screen - renderStandings()
+// bumps it to size2, tightening the column format from 6/5/5 to 4/4/4
+// characters so the wider glyphs still fit this ~152px-wide half of the
+// screen (see the comment at its call site). "Waiting for data..."
+// deliberately stays size1 - it's 19 characters, which would run past
+// the screen edge at size2.
+
 #include <FS.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -357,22 +368,34 @@ void renderStandings() {
   tft.drawFastVLine(160, 0, 240, FLYERS_ORANGE);
   tft.drawFastVLine(161, 0, 240, FLYERS_ORANGE);
 
-  tft.setTextSize(1);
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
 
   if (!haveStandings) {
+    // Stays size1 - "Waiting for data..." is 19 characters, which would
+    // run past the screen's right edge at size2 (this half of the
+    // screen is only ~152px wide). Not worth wrapping logic for a
+    // transient loading message.
+    tft.setTextSize(1);
     tft.setCursor(168, 8);
     tft.println("Waiting for data...");
     return;
   }
 
+  // Table bumped from size1 to size2 per explicit request (it read too
+  // small next to everything else on this screen) - column widths
+  // tightened from 6/5/5 to 4/4/4 chars so the row still fits this
+  // ~152px-wide half at the bigger font (16 chars * ~6px/char *2 would've
+  // run off the screen edge; 12 chars * ~6px/char *2 = ~144px clears it).
+  // Still left-justified with the same %-Ns pattern, so "CAR"/"113" etc.
+  // never get truncated by the width - it's a minimum, not a cap.
+  tft.setTextSize(2);
   char hdr[20];
-  snprintf(hdr, sizeof(hdr), "%-6s%-5s%-5s", "Team", "GP", "Pts");
+  snprintf(hdr, sizeof(hdr), "%-4s%-4s%-4s", "Team", "GP", "Pts");
   tft.setCursor(168, 8);
   tft.println(hdr);
 
   JsonArray rows = standingsDoc["rows"].as<JsonArray>();
-  int y = 26;
+  int y = 30;
   for (JsonObject row : rows) {
     bool isTeam = row["is_team"];
     tft.setTextColor(isTeam ? FLYERS_ORANGE : TFT_BLACK, TFT_WHITE);
@@ -386,9 +409,9 @@ void renderStandings() {
     int gp = wins + losses + otLosses;  // not a payload field - cheap enough to derive here
 
     char line[20];
-    snprintf(line, sizeof(line), "%-6s%-5d%-5d", abbrev, gp, points);
+    snprintf(line, sizeof(line), "%-4s%-4d%-4d", abbrev, gp, points);
     tft.println(line);
-    y += 20;
+    y += 24;  // was 20 - a bit more room for the taller size2 glyphs
   }
 }
 
