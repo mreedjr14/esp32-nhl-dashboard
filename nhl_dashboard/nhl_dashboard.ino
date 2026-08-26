@@ -259,6 +259,21 @@
 // flashed via USB - both iteration 14 and 15's fixes are already on the
 // device, so this is the first release meant to prove the whole OTA path
 // actually works unattended, end to end.
+//
+// Iteration 17 (the v1.2.0 test failed too - a third OTA bug): same
+// symptom as iteration 14 (getLastError()==0, empty string, fails in
+// ~2s) even with the -104 fix from iteration 14 already in place.
+// Confirmed via `curl` from a laptop that the v1.2.0 asset downloads
+// completely fine through GitHub's redirect - so the asset itself was
+// never the problem. The redirect target is a ~900+ character,
+// percent-encoded Azure SAS-token URL; checkForOTAUpdate() no longer
+// trusts HTTPUpdate's own redirect-following for the real download at
+// all - it resolves the Location header itself first (see the comment
+// at that call site) and hands HTTPUpdate an already-final URL. Version
+// deliberately reverted to v1.1.2 here (matching iteration 14/15's
+// pattern) so this fix can bootstrap via USB and then be tested against
+// the *existing* v1.2.0 release live, rather than needing yet another
+// release cut.
 
 #include <FS.h>
 #include <SPI.h>
@@ -335,7 +350,7 @@ const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
 // release identically when cutting a new version, or every device will
 // think that release is newer forever (or, if left the same as an
 // already-installed version, never notice it at all).
-#define FIRMWARE_VERSION "v1.2.0"
+#define FIRMWARE_VERSION "v1.1.2"
 const char* OTA_REPO = "mreedjr14/esp32-nhl-dashboard";
 // Once a day - GitHub's unauthenticated API rate limit (60/hr) is no
 // concern at that cadence, and firmware doesn't change often enough to
@@ -946,18 +961,44 @@ void checkForOTAUpdate() {
     return;
   }
 
-  Serial.printf("[OTA] Downloading %s\n", downloadUrl);
+  // GitHub's browser_download_url is a redirect (302) to a very long
+  // (~900+ char), heavily percent-encoded Azure SAS-token URL on a
+  // different host (release-assets.githubusercontent.com). Confirmed via
+  // `curl` from a laptop that the asset itself downloads cleanly through
+  // that redirect - but ESP32's HTTPClient/HTTPUpdate following it
+  // *internally* failed fast with no usable error (getLastError()==0,
+  // empty string) on real hardware, twice, immediately after the
+  // earlier -104 fix. Rather than trust HTTPUpdate's own redirect
+  // handling for the actual multi-hundred-KB download, resolve the
+  // redirect ourselves first (a tiny, low-risk request whose only job is
+  // reading the Location header as a full String, not a fixed buffer),
+  // then hand HTTPUpdate the already-resolved final URL - so the real
+  // download is a single clean connection to the CDN host from scratch,
+  // never touching HTTPUpdate's redirect-following logic at all.
+  WiFiClientSecure redirectClient;
+  redirectClient.setInsecure();
+  HTTPClient redirectHttp;
+  redirectHttp.begin(redirectClient, downloadUrl);
+  redirectHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  redirectHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
+  int redirectCode = redirectHttp.GET();
+  String finalUrl = downloadUrl;
+  if (redirectCode == 301 || redirectCode == 302 || redirectCode == 303 ||
+      redirectCode == 307 || redirectCode == 308) {
+    finalUrl = redirectHttp.header("Location");
+  }
+  redirectHttp.end();
+
+  if (finalUrl.length() == 0) {
+    Serial.println("[OTA] Redirect resolution failed - no Location header.");
+    return;
+  }
+  Serial.printf("[OTA] Resolved redirect (%d), downloading %d-char URL\n", redirectCode, finalUrl.length());
+
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
-  // GitHub's browser_download_url is a redirect (302) to a signed URL on
-  // a different host (objects.githubusercontent.com) - HTTPUpdate doesn't
-  // follow redirects by default, so without this it sees a 302 where it
-  // expects 200 and fails with HTTP_UE_SERVER_WRONG_HTTP_CODE (-104).
-  // Confirmed live: this was the actual cause of the first real OTA test
-  // failing.
-  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   httpUpdate.rebootOnUpdate(true);  // on success this call never returns - the device reboots itself into the new firmware
-  httpUpdate.update(updateClient, downloadUrl);
+  httpUpdate.update(updateClient, finalUrl);
   // Only reachable if the update download/flash itself failed (bad
   // asset, dropped connection mid-download, etc.) - nothing to do beyond
   // letting the caller continue on the current firmware; next check
