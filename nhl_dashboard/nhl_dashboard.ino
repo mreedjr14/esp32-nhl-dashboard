@@ -391,12 +391,17 @@ void renderClock() {
   // the correct/expected form, not a leading zero to strip).
   const char* text = (!military && buf[0] == '0') ? buf + 1 : buf;
 
-  const int x0 = 4, y0 = 216, w = 68, h = 20;
+  // Doubled from the original 68x20/size1 box per explicit request (it
+  // read too small) - left edge (x0) and bottom edge (y0+h) both stay
+  // exactly where they were, so w/h double by growing upward and
+  // rightward instead of in every direction. Cursor offset and text size
+  // scale by the same factor so the text stays proportioned inside it.
+  const int x0 = 4, y0 = 196, w = 136, h = 40;
   tft.fillRect(x0, y0, w, h, TFT_WHITE);
   tft.drawRect(x0, y0, w, h, FLYERS_ORANGE);
-  tft.setTextSize(1);
+  tft.setTextSize(2);
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
-  tft.setCursor(x0 + 5, y0 + 6);
+  tft.setCursor(x0 + 10, y0 + 12);
   tft.print(text);
 }
 
