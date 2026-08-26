@@ -406,6 +406,28 @@
 // connection - extended both updateClient's and updateHttp's read
 // timeouts to 15s to stop that stall from being flagged as a timeout at
 // all.
+//
+// Iteration 28 (iteration 27's theory was wrong - the real mechanism,
+// from reading the actual Updater.cpp source for this exact core
+// version): the 15s timeout bump had no effect - identical failure,
+// identical exact byte count, identical instant end()-after-write
+// timing. Fetched espressif/arduino-esp32's 3.3.11 Updater.cpp directly
+// and traced it: UPDATE_SIZE_UNKNOWN (used at begin() so its allocation
+// could run before the download connection opens - iteration 25) makes
+// Update expect the FULL PARTITION size (1966080 bytes) as the target,
+// not this image's real 1239488. writeStream() has no other way to know
+// when to stop - after writing all the real data it keeps trying to
+// read ~726KB more that will never come, hits 300 failed reads at 100ms
+// apart (30s - which is where the extra time was actually going, not a
+// transient stall), and marks UPDATE_ERROR_STREAM right as it gives up.
+// The written-byte count it returns at that point is still exactly
+// correct, since the abort happens on a read that contributed nothing
+// new. Fix: since our own written == contentLength check already proves
+// the real data is complete, explicitly Update.clearError() when the
+// error is specifically UPDATE_ERROR_STREAM, then call Update.end(true)
+// (evenIfRemaining) instead of end() - which also corrects _size to
+// match actual progress internally, avoiding a second "premature end"
+// rejection from the size mismatch that caused this in the first place.
 
 #include <FS.h>
 #include <SPI.h>
@@ -1187,15 +1209,11 @@ void checkForOTAUpdate() {
   // visibly or prints a real reason.
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
-  // Default read timeout is too tight for a ~1.2MB transfer interleaved
-  // with actual flash writes (each writeStream() chunk pauses to erase/
-  // write flash before the next socket read, which can make that next
-  // read look "slow" relative to a short timeout even though the
-  // connection itself is fine). Confirmed live (iteration 27): every
-  // byte (1239488 of 1239488) made it through writeStream() successfully,
-  // but Update.end() still refused with "Stream Read Timeout" - a
-  // transient stall during the transfer, not an actual dropped
-  // connection or missing data.
+  // Longer than the default, mainly so a slow chunk during the ~1.2MB
+  // transfer doesn't add yet another failure mode on top of the one
+  // this iteration actually turned out to be (see the UPDATE_SIZE_UNKNOWN
+  // comment below, at writeStream()'s error handling - not a timeout
+  // problem at all, so this alone didn't fix iteration 27's failure).
   updateClient.setTimeout(15000);
   HTTPClient updateHttp;
   updateHttp.begin(updateClient, finalUrl);
@@ -1225,7 +1243,24 @@ void checkForOTAUpdate() {
     return;
   }
 
-  if (!Update.end() || !Update.isFinished()) {
+  // UPDATE_SIZE_UNKNOWN (used at begin(), so its own allocation could run
+  // before this connection opened - see the comment there) tells Update
+  // to expect the FULL PARTITION size (1966080 bytes), not this specific
+  // image's real size. writeStream() has no other way to know when to
+  // stop, so once the real 1239488 bytes are fully written it keeps
+  // waiting for ~726KB more that will never arrive - 300 failed reads at
+  // 100ms apart (30s, matching the extra time actually observed) before
+  // giving up and marking UPDATE_ERROR_STREAM. That's the earlier 15s
+  // timeout theory corrected: it was never a transient stall, it was
+  // Update legitimately waiting for data we already fully have. Since we
+  // independently just confirmed the byte count matches exactly, this
+  // specific error is safe to clear; end(true) additionally tells it not
+  // to treat the (correctly!) undersized total as "premature."
+  if (Update.getError() == UPDATE_ERROR_STREAM) {
+    Update.clearError();
+  }
+
+  if (!Update.end(true) || !Update.isFinished()) {
     Serial.printf("[OTA] Update.end() failed: %s\n", Update.errorString());
     updateHttp.end();
     return;
