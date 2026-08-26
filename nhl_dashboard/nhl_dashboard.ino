@@ -223,6 +223,18 @@
 // screen (see the comment at its call site). "Waiting for data..."
 // deliberately stays size1 - it's 19 characters, which would run past
 // the screen edge at size2.
+//
+// Iteration 14 (first real OTA test, and the fix it turned up): the
+// v1.1.0 release (iteration 13's change) was the first OTA update
+// actually attempted against real hardware - it failed with
+// HTTP_UE_SERVER_WRONG_HTTP_CODE (-104), root-caused via the new Serial
+// logging in checkForOTAUpdate() to GitHub's browser_download_url being
+// a redirect (302) to a different host, which HTTPUpdate doesn't follow
+// unless told to. httpUpdate.setFollowRedirects() fixes it - see its
+// call site. This fix has to reach a device via USB once (a device
+// can't OTA its way out of not being able to follow the OTA download's
+// own redirect), but every device after that, and every future release,
+// should OTA normally from here on.
 
 #include <FS.h>
 #include <SPI.h>
@@ -299,7 +311,7 @@ const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
 // release identically when cutting a new version, or every device will
 // think that release is newer forever (or, if left the same as an
 // already-installed version, never notice it at all).
-#define FIRMWARE_VERSION "v1.0.0"
+#define FIRMWARE_VERSION "v1.1.1"
 const char* OTA_REPO = "mreedjr14/esp32-nhl-dashboard";
 // Once a day - GitHub's unauthenticated API rate limit (60/hr) is no
 // concern at that cadence, and firmware doesn't change often enough to
@@ -894,6 +906,13 @@ void checkForOTAUpdate() {
   Serial.printf("[OTA] Downloading %s\n", downloadUrl);
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
+  // GitHub's browser_download_url is a redirect (302) to a signed URL on
+  // a different host (objects.githubusercontent.com) - HTTPUpdate doesn't
+  // follow redirects by default, so without this it sees a 302 where it
+  // expects 200 and fails with HTTP_UE_SERVER_WRONG_HTTP_CODE (-104).
+  // Confirmed live: this was the actual cause of the first real OTA test
+  // failing.
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   httpUpdate.rebootOnUpdate(true);  // on success this call never returns - the device reboots itself into the new firmware
   httpUpdate.update(updateClient, downloadUrl);
   // Only reachable if the update download/flash itself failed (bad
