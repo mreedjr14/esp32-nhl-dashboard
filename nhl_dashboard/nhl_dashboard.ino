@@ -449,6 +449,21 @@
 // longer needed once the root cause producing that error is gone, and
 // keeping it would have silently masked a genuine future stream failure
 // instead of surfacing it.
+//
+// Confirmed live: this device rebooted itself from v1.1.2 straight to
+// v1.2.0 with zero USB involvement, then correctly reported "Already up
+// to date" on the next boot - the full OTA path (redirect resolution,
+// exact-size lookup, Update.begin/writeStream/end, self-reboot, version
+// comparison) working unattended, for the first time, end to end.
+//
+// v1.3.0 (this bump): the published v1.2.0 release predates every OTA
+// fix above (iterations 17-29) - it was built right after iteration 16,
+// before the redirect bug was even found. A device that OTAs to v1.2.0
+// inherits that old, broken OTA code, right back where this device
+// started. This version exists so a fresh gold-master release has every
+// fix already in it - both for boards getting flashed straight from this
+// source, and so any *future* release these boards OTA to isn't handed
+// to code that can't reliably apply it.
 
 #include <FS.h>
 #include <SPI.h>
@@ -526,7 +541,7 @@ const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
 // release identically when cutting a new version, or every device will
 // think that release is newer forever (or, if left the same as an
 // already-installed version, never notice it at all).
-#define FIRMWARE_VERSION "v1.1.2"
+#define FIRMWARE_VERSION "v1.3.0"
 const char* OTA_REPO = "mreedjr14/esp32-nhl-dashboard";
 // Once a day - GitHub's unauthenticated API rate limit (60/hr) is no
 // concern at that cadence, and firmware doesn't change often enough to
