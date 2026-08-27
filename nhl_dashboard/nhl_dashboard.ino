@@ -428,6 +428,27 @@
 // (evenIfRemaining) instead of end() - which also corrects _size to
 // match actual progress internally, avoiding a second "premature end"
 // rejection from the size mismatch that caused this in the first place.
+//
+// Iteration 29 (iteration 28's clearError() workaround wasn't enough -
+// the real fix): confirmed live - end(true) still failed, now reporting
+// "No Error" specifically (not "Stream Read Timeout" - so clearError()
+// did work), yet still returned false. Read _abort()'s actual source:
+// it calls _reset() BEFORE setting the error code, wiping the entire
+// update session (partition handle, size, progress, buffer) - not just
+// flagging an error. So by the time writeStream()'s 30s timeout fires
+// and returns, there's no session left to finish; clearing the error
+// code afterward can't undo that reset. The only real fix is preventing
+// that timeout from ever firing: added a short-lived, scoped "size
+// check" connection (same closed-before-moving-on pattern as the
+// redirect resolution above) that learns the exact Content-Length
+// before Update.begin() runs, replacing UPDATE_SIZE_UNKNOWN entirely.
+// writeStream() now has the real target size from the start, so
+// remaining() correctly reaches 0 exactly when the real data ends,
+// never entering the timeout path in the first place. The
+// clearError()/end(true) workaround from iteration 28 is removed - no
+// longer needed once the root cause producing that error is gone, and
+// keeping it would have silently masked a genuine future stream failure
+// instead of surfacing it.
 
 #include <FS.h>
 #include <SPI.h>
@@ -1169,6 +1190,36 @@ void checkForOTAUpdate() {
   Serial.printf("[OTA] Resolved redirect (%d), downloading %d-char URL, free heap %u\n",
                 redirectCode, finalUrl.length(), ESP.getFreeHeap());
 
+  // Iteration 29: learn the EXACT size first via its own short-lived,
+  // scoped connection (same pattern as the redirect resolution above -
+  // a GET whose body is never read, just closed after checking headers)
+  // - UPDATE_SIZE_UNKNOWN (iterations 23/25) turned out to be the actual
+  // root cause of iterations 27/28's failures: it makes Update expect
+  // the FULL PARTITION size, not this image's real size, so writeStream()
+  // has no way to know when to stop and eventually times out waiting for
+  // data that will never come - and worse, that timeout's internal
+  // _abort() call fully resets the update session (partition handle,
+  // buffer, progress), not just an error flag, so there was no clean way
+  // to recover after the fact (confirmed by reading _abort()'s actual
+  // source - it calls _reset() before setting the error code). Knowing
+  // the exact size up front avoids all of that.
+  int contentLength = -1;
+  {
+    WiFiClientSecure peekClient;
+    peekClient.setInsecure();
+    HTTPClient peekHttp;
+    peekHttp.begin(peekClient, finalUrl);
+    peekHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
+    int peekCode = peekHttp.GET();
+    contentLength = peekHttp.getSize();
+    Serial.printf("[OTA] Size-check request returned HTTP %d, Content-Length %d\n", peekCode, contentLength);
+    peekHttp.end();
+    if (peekCode != HTTP_CODE_OK || contentLength <= 0) {
+      Serial.println("[OTA] Size-check request didn't return a valid size - aborting.");
+      return;
+    }
+  }
+
   // Ground truth instead of more guessing - the last theory (OTA
   // partition too small) looked solid on paper and was wrong even after
   // confirming a 1.9MB scheme and a full flash erase, so print exactly
@@ -1192,12 +1243,10 @@ void checkForOTAUpdate() {
   // buffer all share one small internal SRAM pool, and by the time a
   // download's own TLS session was already open (needed to stream the
   // image), there wasn't one large enough contiguous block left for
-  // Update's own buffer. WiFiClientSecure has no public API in this
-  // ESP32 core version to shrink its mbedTLS buffers (confirmed - no
-  // setBufferSizes() member exists), so instead: get Update's allocation
-  // done FIRST, while heap is at its least fragmented, then open the
-  // download connection only after that succeeds.
-  if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+  // Update's own buffer. The size-check connection above is already
+  // closed by this point too, for the same reason. Now passes the exact
+  // size learned above (iteration 29) instead of UPDATE_SIZE_UNKNOWN.
+  if (!Update.begin(contentLength)) {
     Serial.printf("[OTA] Update.begin() failed (%s).\n", Update.errorString());
     return;
   }
@@ -1209,27 +1258,22 @@ void checkForOTAUpdate() {
   // visibly or prints a real reason.
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
-  // Longer than the default, mainly so a slow chunk during the ~1.2MB
-  // transfer doesn't add yet another failure mode on top of the one
-  // this iteration actually turned out to be (see the UPDATE_SIZE_UNKNOWN
-  // comment below, at writeStream()'s error handling - not a timeout
-  // problem at all, so this alone didn't fix iteration 27's failure).
-  updateClient.setTimeout(15000);
+  updateClient.setTimeout(15000);  // a bit more headroom than the default for a ~1.2MB transfer
   HTTPClient updateHttp;
   updateHttp.begin(updateClient, finalUrl);
   updateHttp.addHeader("User-Agent", "esp32-nhl-dashboard");
   updateHttp.setTimeout(15000);
   int updateCode = updateHttp.GET();
-  int contentLength = updateHttp.getSize();
-  Serial.printf("[OTA] Download request returned HTTP %d, Content-Length %d\n", updateCode, contentLength);
+  int downloadContentLength = updateHttp.getSize();
+  Serial.printf("[OTA] Download request returned HTTP %d, Content-Length %d\n", updateCode, downloadContentLength);
 
-  if (updateCode != HTTP_CODE_OK || contentLength <= 0) {
+  if (updateCode != HTTP_CODE_OK || downloadContentLength != contentLength) {
     // Update.begin() already succeeded above with no matching end() -
     // left as-is rather than adding abort-handling for what should be a
     // rare case (the download itself has proven reliable in every prior
     // round) - Update's state is per-boot, so the next check (this loop
     // or the next boot) starts clean regardless.
-    Serial.println("[OTA] Download request didn't return 200 with a valid size - aborting.");
+    Serial.println("[OTA] Download request didn't match the size already committed to - aborting.");
     updateHttp.end();
     return;
   }
@@ -1243,24 +1287,7 @@ void checkForOTAUpdate() {
     return;
   }
 
-  // UPDATE_SIZE_UNKNOWN (used at begin(), so its own allocation could run
-  // before this connection opened - see the comment there) tells Update
-  // to expect the FULL PARTITION size (1966080 bytes), not this specific
-  // image's real size. writeStream() has no other way to know when to
-  // stop, so once the real 1239488 bytes are fully written it keeps
-  // waiting for ~726KB more that will never arrive - 300 failed reads at
-  // 100ms apart (30s, matching the extra time actually observed) before
-  // giving up and marking UPDATE_ERROR_STREAM. That's the earlier 15s
-  // timeout theory corrected: it was never a transient stall, it was
-  // Update legitimately waiting for data we already fully have. Since we
-  // independently just confirmed the byte count matches exactly, this
-  // specific error is safe to clear; end(true) additionally tells it not
-  // to treat the (correctly!) undersized total as "premature."
-  if (Update.getError() == UPDATE_ERROR_STREAM) {
-    Update.clearError();
-  }
-
-  if (!Update.end(true) || !Update.isFinished()) {
+  if (!Update.end() || !Update.isFinished()) {
     Serial.printf("[OTA] Update.end() failed: %s\n", Update.errorString());
     updateHttp.end();
     return;
