@@ -464,6 +464,28 @@
 // fix already in it - both for boards getting flashed straight from this
 // source, and so any *future* release these boards OTA to isn't handed
 // to code that can't reliably apply it.
+//
+// Iteration 30 (next-5-games schedule slide, per explicit request): new
+// SCREEN_SCHEDULE between standings and the roster cards - one dense
+// screen (not cycled one game at a time, per explicit request) showing
+// all 5 upcoming games at once: team/home-away/date/time per game (size2,
+// primary info) plus venue and US TV networks (size1, secondary) on a
+// second line each. dashboard_publish.py's new dashboard/{team}/schedule
+// topic carries raw UTC start times rather than pre-formatted ones -
+// formatGameDateTime() converts to local time itself (same TZ this
+// sketch already configured for the clock via configTzTime()), so the
+// same payload renders correctly regardless of which zone a given friend
+// picked in the setup portal. callback()/reconnectMQTT() generalized
+// from a two-way standings-or-roster split to an explicit per-topic
+// dispatch now that there are three topics, not two.
+//
+// Still unverified like every visual change here: the two-line-per-game
+// layout actually stays clear of the clock box at the bottom-left (sized
+// deliberately to clear it on paper, see renderSchedule()'s own
+// comment), long venue names + multiple TV networks don't run off the
+// right edge of the screen, and timegm() is available in this exact
+// ESP32 core's newlib (a standard POSIX extension, expected to work, but
+// not something used elsewhere in this file before now).
 
 #include <FS.h>
 #include <SPI.h>
@@ -489,6 +511,7 @@ Preferences prefs;
 char teamCode[4] = "PHI";
 char standingsTopic[24];
 char rosterTopic[24];
+char scheduleTopic[24];
 
 // Time zone abbreviation + display format, both portal-configurable
 // (iteration 9) so a friend in a different zone, or one who wants 24h
@@ -569,15 +592,18 @@ uint16_t FLYERS_ORANGE;
 // --------------------------------------------------------------------
 JsonDocument standingsDoc;
 JsonDocument rosterDoc;
+JsonDocument scheduleDoc;
 bool haveStandings = false;
 bool haveRoster = false;
+bool haveSchedule = false;
 
-enum Screen { SCREEN_STANDINGS, SCREEN_ROSTER, SCREEN_GOALIES };
+enum Screen { SCREEN_STANDINGS, SCREEN_SCHEDULE, SCREEN_ROSTER, SCREEN_GOALIES };
 Screen currentScreen = SCREEN_STANDINGS;
 unsigned long screenChangedAt = 0;
 int rosterIndex = 0;
 
 const unsigned long STANDINGS_DURATION_MS   = 15000;
+const unsigned long SCHEDULE_DURATION_MS    = 15000;
 const unsigned long PLAYER_CARD_DURATION_MS = 15000;
 
 // --------------------------------------------------------------------
@@ -654,6 +680,117 @@ void renderStandings() {
     snprintf(line, sizeof(line), "%-4s%-4d%-4d", abbrev, gp, points);
     tft.println(line);
     y += 24;  // was 20 - a bit more room for the taller size2 glyphs
+  }
+}
+
+// Parses "YYYY-MM-DDTHH:MM:SSZ" (ISO8601 UTC - exactly what NHL's API and
+// dashboard_publish.py's schedule payload both use) into local date/time
+// strings, honoring the same 12h/24h preference as renderClock(). Doing
+// the UTC->local conversion here rather than server-side means one
+// payload works correctly for every friend's device regardless of which
+// time zone they picked in the setup portal - the device already has
+// its own TZ configured via configTzTime() in setup(). timegm() is a
+// standard newlib/POSIX extension, expected to be available on ESP32,
+// but unverified here like everything else in this file - flash and
+// check the actual game times land in the right zone.
+void formatGameDateTime(const char* startUtc, char* dateBuf, size_t dateBufSize, char* timeBuf, size_t timeBufSize) {
+  struct tm tmUtc = {};
+  int year, month, day, hour, minute, second;
+  sscanf(startUtc, "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &minute, &second);
+  tmUtc.tm_year = year - 1900;
+  tmUtc.tm_mon = month - 1;
+  tmUtc.tm_mday = day;
+  tmUtc.tm_hour = hour;
+  tmUtc.tm_min = minute;
+  tmUtc.tm_sec = second;
+  time_t utcEpoch = timegm(&tmUtc);
+
+  struct tm localTm;
+  localtime_r(&utcEpoch, &localTm);
+
+  strftime(dateBuf, dateBufSize, "%a %m/%d", &localTm);
+
+  bool military = (strcmp(timeFormat, "24") == 0);
+  if (military) {
+    strftime(timeBuf, timeBufSize, "%H:%M", &localTm);
+  } else {
+    char raw[12];
+    strftime(raw, sizeof(raw), "%I:%M %p", &localTm);
+    const char* trimmed = (raw[0] == '0') ? raw + 1 : raw;
+    strncpy(timeBuf, trimmed, timeBufSize - 1);
+    timeBuf[timeBufSize - 1] = '\0';
+  }
+}
+
+// Next 5 upcoming games, all on one screen (per explicit request) rather
+// than cycling one game at a time like the roster cards - two lines per
+// game: team/home-away/date/time at size2 since that's the primary
+// "what and when" info, venue+TV at size1 below it since it's secondary
+// detail and there's a lot of it to fit. Row height (32px) deliberately
+// keeps all 5 rows clear of the clock box, which occupies the bottom-left
+// corner (y 196-236, see renderClock()) - the 5th row's second line lands
+// around y=184, a 12px margin above it.
+void renderSchedule() {
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(8, 6);
+  tft.println("Next 5 Games");
+  tft.drawFastHLine(8, 30, 304, FLYERS_ORANGE);
+  tft.drawFastHLine(8, 31, 304, FLYERS_ORANGE);
+
+  if (!haveSchedule) {
+    tft.setTextSize(1);
+    tft.setCursor(8, 40);
+    tft.println("Waiting for data...");
+    return;
+  }
+
+  const int ROW_HEIGHT = 32;
+  int y = 38;
+  for (JsonObject g : scheduleDoc["games"].as<JsonArray>()) {
+    const char* opponent = g["opponent"] | "???";
+    bool isHome = g["is_home"];
+    const char* startUtc = g["start_utc"] | "";
+
+    char dateBuf[12] = "";
+    char timeBuf[10] = "";
+    if (startUtc[0]) {
+      formatGameDateTime(startUtc, dateBuf, sizeof(dateBuf), timeBuf, sizeof(timeBuf));
+    }
+
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setCursor(8, y);
+    char line1[32];
+    snprintf(line1, sizeof(line1), "%s%-4s%s %s", isHome ? "vs " : "@  ", opponent, dateBuf, timeBuf);
+    tft.println(line1);
+
+    // TV networks joined with "/" - sent as an array rather than a
+    // pre-joined string from the Python side so the device controls the
+    // formatting here, not the publisher.
+    char tvStr[36] = "";
+    bool firstNet = true;
+    for (JsonVariant net : g["tv"].as<JsonArray>()) {
+      const char* n = net.as<const char*>();
+      if (!n) continue;
+      if (!firstNet) strncat(tvStr, "/", sizeof(tvStr) - strlen(tvStr) - 1);
+      strncat(tvStr, n, sizeof(tvStr) - strlen(tvStr) - 1);
+      firstNet = false;
+    }
+
+    const char* venue = g["venue"] | "";
+    char line2[72];
+    if (tvStr[0]) {
+      snprintf(line2, sizeof(line2), "%s  TV: %s", venue, tvStr);
+    } else {
+      snprintf(line2, sizeof(line2), "%s", venue);
+    }
+    tft.setTextSize(1);
+    tft.setCursor(8, y + 18);
+    tft.println(line2);
+
+    y += ROW_HEIGHT;
   }
 }
 
@@ -962,6 +1099,8 @@ void renderGoalieTable() {
 void render() {
   if (currentScreen == SCREEN_STANDINGS) {
     renderStandings();
+  } else if (currentScreen == SCREEN_SCHEDULE) {
+    renderSchedule();
   } else if (currentScreen == SCREEN_ROSTER) {
     renderPlayerCard();
   } else {
@@ -986,9 +1125,10 @@ int skaterCount() {
 }
 
 // --------------------------------------------------------------------
-// Screen cycling - standings, then each skater in turn, then the goalie
-// table, then back to standings. All local timing, no dependency on the
-// Pi's publish schedule - see this file's header comment.
+// Screen cycling - standings, then the schedule, then each skater in
+// turn, then the goalie table, then back to standings. All local
+// timing, no dependency on the Pi's publish schedule - see this file's
+// header comment.
 // --------------------------------------------------------------------
 
 void advanceScreen() {
@@ -996,6 +1136,14 @@ void advanceScreen() {
 
   if (currentScreen == SCREEN_STANDINGS) {
     if (now - screenChangedAt < STANDINGS_DURATION_MS) return;
+    currentScreen = SCREEN_SCHEDULE;
+    screenChangedAt = now;
+    render();
+    return;
+  }
+
+  if (currentScreen == SCREEN_SCHEDULE) {
+    if (now - screenChangedAt < SCHEDULE_DURATION_MS) return;
     currentScreen = SCREEN_ROSTER;
     rosterIndex = 0;
     screenChangedAt = now;
@@ -1034,12 +1182,36 @@ void advanceScreen() {
 void callback(char* topic, byte* payload, unsigned int length) {
   // setBufferSize() below must be >= the largest payload this ever
   // receives (roster was ~10.5KB once heat map data was added, standings
-  // ~1KB - see bots/alerts/pollers/dashboard_publish.py's own size
-  // check, run after any future field additions) or PubSubClient
-  // silently drops anything over the buffer instead of calling back
-  // with a truncated one.
-  JsonDocument& target = (strcmp(topic, standingsTopic) == 0) ? standingsDoc : rosterDoc;
-  DeserializationError err = deserializeJson(target, payload, length);
+  // ~1KB, schedule a few hundred bytes - see bots/alerts/pollers/
+  // dashboard_publish.py's own size check, run after any future field
+  // additions) or PubSubClient silently drops anything over the buffer
+  // instead of calling back with a truncated one.
+  //
+  // Explicit if/else per topic (not the old two-way ternary) now that
+  // there are three - each one maps to its own doc, "have" flag, and set
+  // of screens that should redraw immediately if this message arrives
+  // while one of them is showing.
+  JsonDocument* target;
+  bool* haveFlag;
+  bool isCurrentScreen;
+
+  if (strcmp(topic, standingsTopic) == 0) {
+    target = &standingsDoc;
+    haveFlag = &haveStandings;
+    isCurrentScreen = (currentScreen == SCREEN_STANDINGS);
+  } else if (strcmp(topic, scheduleTopic) == 0) {
+    target = &scheduleDoc;
+    haveFlag = &haveSchedule;
+    isCurrentScreen = (currentScreen == SCREEN_SCHEDULE);
+  } else if (strcmp(topic, rosterTopic) == 0) {
+    target = &rosterDoc;
+    haveFlag = &haveRoster;
+    isCurrentScreen = (currentScreen == SCREEN_ROSTER || currentScreen == SCREEN_GOALIES);
+  } else {
+    return;  // subscribed to something we don't otherwise handle - shouldn't happen
+  }
+
+  DeserializationError err = deserializeJson(*target, payload, length);
   if (err) {
     Serial.print("JSON parse failed for ");
     Serial.print(topic);
@@ -1048,17 +1220,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  if (strcmp(topic, standingsTopic) == 0) {
-    haveStandings = true;
-  } else {
-    haveRoster = true;
-  }
+  *haveFlag = true;
 
   // Redraw immediately only if this topic's screen is the one currently
   // showing - avoids interrupting whatever's on screen right now with an
-  // update for the other screen.
-  if ((strcmp(topic, standingsTopic) == 0 && currentScreen == SCREEN_STANDINGS) ||
-      (strcmp(topic, rosterTopic) == 0 && (currentScreen == SCREEN_ROSTER || currentScreen == SCREEN_GOALIES))) {
+  // update for a different screen.
+  if (isCurrentScreen) {
     render();
   }
 }
@@ -1068,6 +1235,7 @@ void reconnectMQTT() {
     if (client.connect("CYD-NHL-Dashboard", mqtt_username, mqtt_password)) {
       client.subscribe(standingsTopic);
       client.subscribe(rosterTopic);
+      client.subscribe(scheduleTopic);
     } else {
       delay(2000);
     }
@@ -1507,6 +1675,7 @@ void setup() {
   // without a reboot.
   snprintf(standingsTopic, sizeof(standingsTopic), "dashboard/%s/standings", teamCode);
   snprintf(rosterTopic, sizeof(rosterTopic), "dashboard/%s/roster", teamCode);
+  snprintf(scheduleTopic, sizeof(scheduleTopic), "dashboard/%s/schedule", teamCode);
 
   // Encrypts the connection without pinning/bundling HiveMQ Cloud's CA
   // certificate on-device - a reasonable tradeoff for a hobby display,
