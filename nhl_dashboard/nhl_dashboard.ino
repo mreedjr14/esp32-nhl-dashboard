@@ -572,7 +572,7 @@ const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
 // release identically when cutting a new version, or every device will
 // think that release is newer forever (or, if left the same as an
 // already-installed version, never notice it at all).
-#define FIRMWARE_VERSION "v1.3.0"
+#define FIRMWARE_VERSION "v1.4.0"
 const char* OTA_REPO = "mreedjr14/esp32-nhl-dashboard";
 // Once a day - GitHub's unauthenticated API rate limit (60/hr) is no
 // concern at that cadence, and firmware doesn't change often enough to
