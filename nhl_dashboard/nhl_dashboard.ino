@@ -482,10 +482,18 @@
 // Still unverified like every visual change here: the two-line-per-game
 // layout actually stays clear of the clock box at the bottom-left (sized
 // deliberately to clear it on paper, see renderSchedule()'s own
-// comment), long venue names + multiple TV networks don't run off the
-// right edge of the screen, and timegm() is available in this exact
-// ESP32 core's newlib (a standard POSIX extension, expected to work, but
-// not something used elsewhere in this file before now).
+// comment), and long venue names + multiple TV networks don't run off
+// the right edge of the screen.
+//
+// Iteration 31 (timegm() doesn't exist in this core): confirmed via a
+// real compile error - "'timegm' was not declared in this scope" - that
+// the timegm() call this iteration originally used isn't available in
+// this ESP32 core's newlib, unlike the standard mktime()/localtime_r()
+// this file already relied on elsewhere. Replaced with a manual
+// UTC-struct-tm-to-epoch conversion (utcMktime(), see its own comment)
+// that doesn't call any timezone-aware libc function at all, sidestepping
+// the problem entirely rather than searching for an alternate library
+// function that might have the same availability issue.
 
 #include <FS.h>
 #include <SPI.h>
@@ -683,16 +691,41 @@ void renderStandings() {
   }
 }
 
+// Manual replacement for timegm() - confirmed live it doesn't exist in
+// this ESP32 core's newlib (compile error: "'timegm' was not declared in
+// this scope"), unlike the standard-C mktime()/localtime_r() this file
+// already uses elsewhere. mktime() isn't a substitute either - it
+// interprets its input as *local* time (applying whatever TZ
+// configTzTime() set), which is exactly wrong for a UTC input. This
+// computes UTC epoch seconds directly, with no timezone-aware libc call
+// involved at all - just a days-since-1970-01-01 count (leap years
+// included) plus the time-of-day, per the standard portable technique
+// for exactly this "no timegm() available" situation.
+time_t utcMktime(struct tm* tmUtc) {
+  static const int cumulativeDays[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+  int year = tmUtc->tm_year + 1900;
+  int month = tmUtc->tm_mon;  // 0-11
+  bool isLeapYear = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+
+  long days = 0;
+  for (int y = 1970; y < year; y++) {
+    days += ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 366 : 365;
+  }
+  days += cumulativeDays[month];
+  if (month > 1 && isLeapYear) days++;  // leap day, only once past February in a leap year
+  days += tmUtc->tm_mday - 1;
+
+  long seconds = days * 86400L + tmUtc->tm_hour * 3600L + tmUtc->tm_min * 60L + tmUtc->tm_sec;
+  return (time_t)seconds;
+}
+
 // Parses "YYYY-MM-DDTHH:MM:SSZ" (ISO8601 UTC - exactly what NHL's API and
 // dashboard_publish.py's schedule payload both use) into local date/time
 // strings, honoring the same 12h/24h preference as renderClock(). Doing
 // the UTC->local conversion here rather than server-side means one
 // payload works correctly for every friend's device regardless of which
 // time zone they picked in the setup portal - the device already has
-// its own TZ configured via configTzTime() in setup(). timegm() is a
-// standard newlib/POSIX extension, expected to be available on ESP32,
-// but unverified here like everything else in this file - flash and
-// check the actual game times land in the right zone.
+// its own TZ configured via configTzTime() in setup().
 void formatGameDateTime(const char* startUtc, char* dateBuf, size_t dateBufSize, char* timeBuf, size_t timeBufSize) {
   struct tm tmUtc = {};
   int year, month, day, hour, minute, second;
@@ -703,7 +736,7 @@ void formatGameDateTime(const char* startUtc, char* dateBuf, size_t dateBufSize,
   tmUtc.tm_hour = hour;
   tmUtc.tm_min = minute;
   tmUtc.tm_sec = second;
-  time_t utcEpoch = timegm(&tmUtc);
+  time_t utcEpoch = utcMktime(&tmUtc);
 
   struct tm localTm;
   localtime_r(&utcEpoch, &localTm);
