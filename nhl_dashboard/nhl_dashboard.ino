@@ -1,8 +1,9 @@
-// NHL dashboard companion for the Pi - subscribes to two retained MQTT
-// topics (Flyers division standings + a compact stat card per roster
-// player, both published by bots/alerts/pollers/dashboard_publish.py
-// every ~20 min) and cycles between/within them entirely on its own
-// timer. The ESP32 never talks to NHL's API itself - it only ever shows
+// NHL dashboard companion for the Pi - subscribes to several retained MQTT
+// topics (division standings, a compact stat card per roster player, next
+// 5 games, last 5 games' results, top 3 scorers over their own last 5
+// games - all published by bots/alerts/pollers/dashboard_publish.py every
+// ~20 min) and cycles between/within them entirely on its own timer. The
+// ESP32 never talks to NHL's API itself - it only ever shows
 // whatever it last received, same "subscribe and render" shape as
 // test_message_receiver.ino, just parsing structured JSON instead of a
 // raw string and cycling through multiple screens instead of showing one.
@@ -494,6 +495,27 @@
 // that doesn't call any timezone-aware libc function at all, sidestepping
 // the problem entirely rather than searching for an alternate library
 // function that might have the same availability issue.
+//
+// Iteration 32 (last-5-results + top-scorers slides, per explicit
+// request): two new screens, SCREEN_RESULTS and SCREEN_TOPSCORERS,
+// slotted into the cycle between the schedule and the roster cards.
+// renderResults() mirrors renderSchedule()'s one-screen/5-row, two-
+// line-per-game layout (result+score at size2, date at size1) - W/L/OTL
+// colored green/red/orange via rgbColor() (this panel's confirmed R/B
+// swap, see rgbColor()'s own comment), fed by dashboard_publish.py's new
+// dashboard/{team}/results topic. renderTopScorers() only has 3 rows to
+// fill (rank+name at size2, G/A/P at size1), fed by the new dashboard/
+// {team}/topscorers topic - top 3 skaters by points over their own last 5
+// games played (not strictly "the team's last 5 games"; see
+// dashboard_publish.py's build_topscorers_payload() docstring for why).
+// callback()/reconnectMQTT()/setup() extended the same explicit per-topic
+// pattern iteration 30 already established, now for five topics.
+//
+// Still unverified like every visual change here: both new screens'
+// layouts actually clear the clock box, the results screen's win/loss
+// colors render as intended (not swapped) on real hardware, and long
+// player names truncate cleanly at the "%.18s" cutoff instead of
+// overflowing.
 
 #include <FS.h>
 #include <SPI.h>
@@ -520,6 +542,8 @@ char teamCode[4] = "PHI";
 char standingsTopic[24];
 char rosterTopic[24];
 char scheduleTopic[24];
+char resultsTopic[24];
+char topscorersTopic[28];  // "dashboard/XXX/topscorers" needs 25 bytes - the others' 24 is one short for this suffix
 
 // Time zone abbreviation + display format, both portal-configurable
 // (iteration 9) so a friend in a different zone, or one who wants 24h
@@ -572,7 +596,7 @@ const char* mqtt_password = "2!ZT^QMd*5$gHRxN59%U";
 // release identically when cutting a new version, or every device will
 // think that release is newer forever (or, if left the same as an
 // already-installed version, never notice it at all).
-#define FIRMWARE_VERSION "v1.4.0"
+#define FIRMWARE_VERSION "v1.5.0"
 const char* OTA_REPO = "mreedjr14/esp32-nhl-dashboard";
 // Once a day - GitHub's unauthenticated API rate limit (60/hr) is no
 // concern at that cadence, and firmware doesn't change often enough to
@@ -601,17 +625,23 @@ uint16_t FLYERS_ORANGE;
 JsonDocument standingsDoc;
 JsonDocument rosterDoc;
 JsonDocument scheduleDoc;
+JsonDocument resultsDoc;
+JsonDocument topscorersDoc;
 bool haveStandings = false;
 bool haveRoster = false;
 bool haveSchedule = false;
+bool haveResults = false;
+bool haveTopScorers = false;
 
-enum Screen { SCREEN_STANDINGS, SCREEN_SCHEDULE, SCREEN_ROSTER, SCREEN_GOALIES };
+enum Screen { SCREEN_STANDINGS, SCREEN_SCHEDULE, SCREEN_RESULTS, SCREEN_TOPSCORERS, SCREEN_ROSTER, SCREEN_GOALIES };
 Screen currentScreen = SCREEN_STANDINGS;
 unsigned long screenChangedAt = 0;
 int rosterIndex = 0;
 
 const unsigned long STANDINGS_DURATION_MS   = 15000;
 const unsigned long SCHEDULE_DURATION_MS    = 15000;
+const unsigned long RESULTS_DURATION_MS     = 15000;
+const unsigned long TOPSCORERS_DURATION_MS  = 15000;
 const unsigned long PLAYER_CARD_DURATION_MS = 15000;
 
 // --------------------------------------------------------------------
@@ -824,6 +854,139 @@ void renderSchedule() {
     tft.println(line2);
 
     y += ROW_HEIGHT;
+  }
+}
+
+// Last 5 completed games, most recent first - same one-screen/5-row,
+// two-line-per-game layout and ROW_HEIGHT as renderSchedule() (primary
+// "what happened" at size2, date at size1 below it), just with the
+// schedule's date+time swapped for a result+score. Result color (green/
+// red/orange for W/L/OTL) uses rgbColor(), not the library's plain named
+// constants - see rgbColor()'s own comment on this panel's R/B swap.
+void renderResults() {
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(8, 6);
+  tft.println("Last 5 Games");
+  tft.drawFastHLine(8, 30, 304, FLYERS_ORANGE);
+  tft.drawFastHLine(8, 31, 304, FLYERS_ORANGE);
+
+  if (!haveResults) {
+    tft.setTextSize(1);
+    tft.setCursor(8, 40);
+    tft.println("Waiting for data...");
+    return;
+  }
+
+  JsonArray games = resultsDoc["games"].as<JsonArray>();
+  if (games.size() == 0) {
+    // Genuinely happens, not just a loading state - e.g. before the
+    // season's first game has finished (confirmed via dashboard_publish.py
+    // --dry-run during 2026-27 preseason).
+    tft.setTextSize(1);
+    tft.setCursor(8, 40);
+    tft.println("No completed games yet.");
+    return;
+  }
+
+  const int ROW_HEIGHT = 32;
+  int y = 38;
+  for (JsonObject g : games) {
+    const char* opponent = g["opponent"] | "???";
+    bool isHome = g["is_home"];
+    const char* result = g["result"] | "-";
+    int teamScore = g["team_score"];
+    int oppScore = g["opp_score"];
+    const char* ot = g["ot"] | "";
+
+    uint16_t resultColor = TFT_BLACK;
+    if (strcmp(result, "W") == 0) resultColor = rgbColor(0, 150, 0);
+    else if (strcmp(result, "L") == 0) resultColor = rgbColor(200, 0, 0);
+    else if (strcmp(result, "OTL") == 0) resultColor = FLYERS_ORANGE;
+
+    tft.setTextSize(2);
+    tft.setTextColor(resultColor, TFT_WHITE);
+    tft.setCursor(8, y);
+    char scoreSuffix[8] = "";
+    if (ot[0]) snprintf(scoreSuffix, sizeof(scoreSuffix), " %s", ot);
+    char line1[32];
+    snprintf(line1, sizeof(line1), "%s%-4s%s %d-%d%s", isHome ? "vs " : "@  ", opponent, result, teamScore, oppScore, scoreSuffix);
+    tft.println(line1);
+
+    const char* startUtc = g["start_utc"] | "";
+    char dateBuf[12] = "";
+    if (startUtc[0]) {
+      char unusedTimeBuf[10];
+      formatGameDateTime(startUtc, dateBuf, sizeof(dateBuf), unusedTimeBuf, sizeof(unusedTimeBuf));
+    }
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setCursor(8, y + 18);
+    tft.println(dateBuf);
+
+    y += ROW_HEIGHT;
+  }
+}
+
+// Top 3 skaters by points over their own last 5 games played (see
+// dashboard_publish.py's build_topscorers_payload() docstring for why
+// it's "their own last 5 games", not strictly "the team's last 5 games").
+// Only 3 rows to fill, so each gets more room than the 5-row schedule/
+// results screens: rank+name at size2, the G-A-P breakdown at size1 below
+// it. Name capped at 18 chars via the "%.18s" precision - long enough for
+// every real NHL name tried so far, and a plain truncation (not an
+// ellipsis) matches this file's existing snprintf-bounds-and-move-on style
+// elsewhere (e.g. renderSchedule's opponent/venue fields).
+void renderTopScorers() {
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(8, 6);
+  tft.println("Top Scorers - L5");
+  tft.drawFastHLine(8, 30, 304, FLYERS_ORANGE);
+  tft.drawFastHLine(8, 31, 304, FLYERS_ORANGE);
+
+  if (!haveTopScorers) {
+    tft.setTextSize(1);
+    tft.setCursor(8, 40);
+    tft.println("Waiting for data...");
+    return;
+  }
+
+  JsonArray players = topscorersDoc["players"].as<JsonArray>();
+  if (players.size() == 0) {
+    tft.setTextSize(1);
+    tft.setCursor(8, 40);
+    tft.println("No recent game data yet.");
+    return;
+  }
+
+  const int ROW_HEIGHT = 50;
+  int y = 40;
+  int rank = 1;
+  for (JsonObject p : players) {
+    const char* name = p["name"] | "???";
+    const char* position = p["position"] | "";
+    int goals = p["goals"];
+    int assists = p["assists"];
+    int points = p["points"];
+
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setCursor(8, y);
+    char line1[32];
+    snprintf(line1, sizeof(line1), "%d. %.18s", rank, name);
+    tft.println(line1);
+
+    tft.setTextSize(1);
+    tft.setCursor(8, y + 20);
+    char line2[48];
+    snprintf(line2, sizeof(line2), "%s  %dG %dA  %d PTS", position, goals, assists, points);
+    tft.println(line2);
+
+    y += ROW_HEIGHT;
+    rank++;
   }
 }
 
@@ -1134,6 +1297,10 @@ void render() {
     renderStandings();
   } else if (currentScreen == SCREEN_SCHEDULE) {
     renderSchedule();
+  } else if (currentScreen == SCREEN_RESULTS) {
+    renderResults();
+  } else if (currentScreen == SCREEN_TOPSCORERS) {
+    renderTopScorers();
   } else if (currentScreen == SCREEN_ROSTER) {
     renderPlayerCard();
   } else {
@@ -1158,10 +1325,10 @@ int skaterCount() {
 }
 
 // --------------------------------------------------------------------
-// Screen cycling - standings, then the schedule, then each skater in
-// turn, then the goalie table, then back to standings. All local
-// timing, no dependency on the Pi's publish schedule - see this file's
-// header comment.
+// Screen cycling - standings, then the schedule, then last 5 results,
+// then top scorers, then each skater in turn, then the goalie table,
+// then back to standings. All local timing, no dependency on the Pi's
+// publish schedule - see this file's header comment.
 // --------------------------------------------------------------------
 
 void advanceScreen() {
@@ -1177,6 +1344,22 @@ void advanceScreen() {
 
   if (currentScreen == SCREEN_SCHEDULE) {
     if (now - screenChangedAt < SCHEDULE_DURATION_MS) return;
+    currentScreen = SCREEN_RESULTS;
+    screenChangedAt = now;
+    render();
+    return;
+  }
+
+  if (currentScreen == SCREEN_RESULTS) {
+    if (now - screenChangedAt < RESULTS_DURATION_MS) return;
+    currentScreen = SCREEN_TOPSCORERS;
+    screenChangedAt = now;
+    render();
+    return;
+  }
+
+  if (currentScreen == SCREEN_TOPSCORERS) {
+    if (now - screenChangedAt < TOPSCORERS_DURATION_MS) return;
     currentScreen = SCREEN_ROSTER;
     rosterIndex = 0;
     screenChangedAt = now;
@@ -1236,6 +1419,14 @@ void callback(char* topic, byte* payload, unsigned int length) {
     target = &scheduleDoc;
     haveFlag = &haveSchedule;
     isCurrentScreen = (currentScreen == SCREEN_SCHEDULE);
+  } else if (strcmp(topic, resultsTopic) == 0) {
+    target = &resultsDoc;
+    haveFlag = &haveResults;
+    isCurrentScreen = (currentScreen == SCREEN_RESULTS);
+  } else if (strcmp(topic, topscorersTopic) == 0) {
+    target = &topscorersDoc;
+    haveFlag = &haveTopScorers;
+    isCurrentScreen = (currentScreen == SCREEN_TOPSCORERS);
   } else if (strcmp(topic, rosterTopic) == 0) {
     target = &rosterDoc;
     haveFlag = &haveRoster;
@@ -1269,6 +1460,8 @@ void reconnectMQTT() {
       client.subscribe(standingsTopic);
       client.subscribe(rosterTopic);
       client.subscribe(scheduleTopic);
+      client.subscribe(resultsTopic);
+      client.subscribe(topscorersTopic);
     } else {
       delay(2000);
     }
@@ -1709,6 +1902,8 @@ void setup() {
   snprintf(standingsTopic, sizeof(standingsTopic), "dashboard/%s/standings", teamCode);
   snprintf(rosterTopic, sizeof(rosterTopic), "dashboard/%s/roster", teamCode);
   snprintf(scheduleTopic, sizeof(scheduleTopic), "dashboard/%s/schedule", teamCode);
+  snprintf(resultsTopic, sizeof(resultsTopic), "dashboard/%s/results", teamCode);
+  snprintf(topscorersTopic, sizeof(topscorersTopic), "dashboard/%s/topscorers", teamCode);
 
   // Encrypts the connection without pinning/bundling HiveMQ Cloud's CA
   // certificate on-device - a reasonable tradeoff for a hobby display,
